@@ -30,7 +30,7 @@ if __name__ == '__main__':
     # 載入登入資訊
     # .env 檔案內容範例:
     #   ID=A123456789
-    #   CERTFILEPATH=C:\\CAFubon\\A123456789\\H123071452.pfx
+    #   CERTFILEPATH=C:\\CAFubon\\A123456789\\A123456789.pfx
     #   TRADEPASS=mytradepassword
     #   CERTPASSS=mycertificatepassword
     #   ACTIVEACCOUNT=1111111
