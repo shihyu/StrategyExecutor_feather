@@ -28,7 +28,7 @@ def check_sdk(func):
 
 
 class SDKManager:
-    __version__ = "2024.0.5"
+    __version__ = "2024.2.0"
 
     def __init__(self, max_marketdata_ws_connect=1, logger=None, log_level=logging.DEBUG):
         # Set logger
@@ -74,6 +74,8 @@ class SDKManager:
         self.__max_marketdata_ws_connect = max(min(5, int(max_marketdata_ws_connect)), 1)
         self.__logger.info(f"max_marketdata_ws_connect setting: {self.__max_marketdata_ws_connect}")
 
+        self.__heartbeat_timestamp = time.time()
+
         # Callback lock
         self.__process_lock = threading.Lock()
         self.__re_login_lock_counter = 0
@@ -81,11 +83,14 @@ class SDKManager:
         # Version check
         self.__logger.debug(f"SDK version: {fubon_neo.__version__}")
         self.__logger.debug(f"SDKManager version: {self.__version__}")
+        self.sdk_version = tuple(map(int, (fubon_neo.__version__.split("."))))
 
         # Coordination
         self.__is_alive = True
         self.__is_relogin_running = False
         self.__is_terminate = False
+        self.__termination_initiated = False
+        self.__relogin_lock = threading.Lock()
 
         # Async
         self.__event_loop = asyncio.new_event_loop()
@@ -94,6 +99,7 @@ class SDKManager:
             args=(self.__async_keep_running(),)
         )
         self.__async_thread.start()
+        self.__logger.debug(f"Async loop started ...")
 
         self.__async_lock_by_symbol = {}  # {symbol -> the lock}
         self.__latest_timestamp = {}
@@ -116,6 +122,11 @@ class SDKManager:
     async def __async_keep_running(self):
         try:
             while True:
+                time_now = time.time()
+                if time_now - self.__heartbeat_timestamp > 90:
+                    threading.Thread(target=self.handle_marketdata_ws_disconnect,
+                                     args=(-1, "Heartbeat lost ...")).start()
+                    self.__heartbeat_timestamp = time.time()
                 await asyncio.sleep(5)
         except asyncio.CancelledError:
             self.__logger.debug("__async_keep_running cancelled.")
@@ -175,8 +186,9 @@ class SDKManager:
             self.__cert_password = cert_password
 
             # establish marketdata ws
-            self.establish_marketdata_connection()
+            self.establish_marketdata_connection(caller="login")
 
+            self.__logger.debug(f"登入及建立行情連線步驟完成")
             return True
 
         else:
@@ -185,7 +197,7 @@ class SDKManager:
 
     @check_is_terminated
     def terminate(self):
-        # self.__is_terminate = True
+        self.__termination_initiated = True
 
         if self.sdk is not None:
             try:
@@ -247,6 +259,7 @@ class SDKManager:
                     return False
                 else:
                     time.sleep(5)
+                    self.__logger.debug(f"Retry Login (a) ...")
                     return self.__re_login(retry_counter=retry_counter + 1, max_retry=max_retry)
 
             # Set sdk callback functions
@@ -278,11 +291,13 @@ class SDKManager:
 
             else:
                 time.sleep(5)
+                self.__logger.debug(f"Retry Login (b) ...")
                 return self.__re_login(retry_counter=retry_counter + 1, max_retry=max_retry)
 
         except Exception as e:
             self.__logger.error(f"登入發生錯誤: {e}, 將重試 ... ")
             time.sleep(5)
+            self.__logger.debug(f"Retry login (c) ...")
             return self.__re_login(retry_counter=retry_counter + 1, max_retry=max_retry)
 
     @check_is_terminated
@@ -312,13 +327,21 @@ class SDKManager:
     """
 
     def __handle_trade_ws_event(self, code, message):
-        print(f"trade_ws_event code {code}, {type(code)}")
-        if code in ["300", "301"]:
-            self.__logger.info(f"交易連線異常，啟動重新連線 ..., code {code}")
+        print(f"trade_ws_event code {code}, message {message}")
+        if code in ["300"]:
+            if self.__termination_initiated:
+                self.__logger.info(f"交易連線異常，啟動重新連線 ..., code {code}")
             try:
                 self.sdk.logout()
             except Exception as e:
                 self.__logger.debug(f"Exception: {e}")
+            finally:
+                with self.__relogin_lock:
+                    self.__logger.debug(f"Login (a) ...")
+                    self.__re_login()
+
+        elif code in ["302"]:
+            self.__logger.info(f"交易連線中斷 ..., code {code}")
 
         else:
             self.__logger.debug(f"Trade ws event (debug) code {code}, msg {message}")
@@ -341,7 +364,6 @@ class SDKManager:
             if self.on_disconnect_callback is None:  # For planned termination
                 return
 
-            # with self.__process_lock:
             if self.__is_marketdata_ws_connect:  # Already reconnected
                 self.__logger.debug(f"self.__is_marketdata_ws_connect is {self.__is_marketdata_ws_connect}, ignore...")
                 return
@@ -352,31 +374,34 @@ class SDKManager:
 
             self.__logger.debug(f"Marketdata ws reconnecting ...")
 
-            # Test if the trade connection is alive
-            try:
-                if self.is_login():
-                    response = self.sdk.stock.margin_quota(self.accounts[0], "2330")
-                    self.__logger.debug(f"Trade connection test response\n{response}")
+            # Reconnect marketdata
+            self.establish_marketdata_connection(reconnect=True, caller="disconnect_handler")
 
-                    if not response.is_success and "Login Error" in response.message:
-                        self.__logger.info(f"重連交易連線 ...")
-                        self.__re_login()
+            # Resubscribe all stocks
+            previous_subscription_list = self.__ws_subscription_list.copy()
+            self.__ws_subscription_list = []  # Reset the subscription list
+            self.__subscription_details = {}
 
-            finally:
-                # Reconnect marketdata
-                self.establish_marketdata_connection(reconnect=True)
+            for symbol in previous_subscription_list:
+                self.subscribe_realtime_trades(symbol)
+                time.sleep(0.1)
 
-                # Resubscribe all stocks
-                previous_subscription_list = self.__ws_subscription_list.copy()
-                self.__ws_subscription_list = []  # Reset the subscription list
-                self.__subscription_details = {}
+    def __connection_operator(self):
+        self.sdk.init_realtime()
+        ws = self.sdk.marketdata.websocket_client.stock
+        ws.on("connect", self.on_connect_callback)
+        ws.on("disconnect", self.on_disconnect_callback)
+        ws.on("error", self.on_error_callback)
+        ws.on("message", self.__ws_on_message_handler)
+        ws.connect()
 
-                for symbol in previous_subscription_list:
-                    self.subscribe_realtime_trades(symbol)
-                    time.sleep(0.1)
+        self.__ws_connections.append(ws)
+        self.__ws_subscription_counts.append(0)
+
+        return ws
 
     @check_is_terminated
-    def establish_marketdata_connection(self, reconnect=False, retry_counter=0, max_retry=5, disconnect=None):
+    def establish_marketdata_connection(self, reconnect=False, retry_counter=0, max_retry=5, caller=None):
         if retry_counter > max_retry:
             self.__logger.error(f"登入失敗重試過多 {retry_counter}，延長重試時間 ...")
             time.sleep(5)
@@ -385,7 +410,20 @@ class SDKManager:
             self.__logger.error("請先登入SDK")
             return False
 
+        else:
+            self.__logger.debug(f"Try trade connection ...")
+            with self.__relogin_lock:
+                response = self.sdk.stock.margin_quota(self.accounts[0], "2330")
+                self.__logger.debug(f"Trade connection test response\n{response}")
+
+                if not response.is_success and "Login Error" in response.message:
+                    self.__logger.info(f"重連交易連線 (a) ...")
+                    self.__re_login()
+
+            self.__logger.debug(f"Try trade connection completed")
+
         self.__logger.info("建立行情連線...")
+        self.__logger.debug(f"caller: {caller}")
 
         try:
             disconnect_threads = []
@@ -415,27 +453,27 @@ class SDKManager:
             try:
                 for i in range(self.__max_marketdata_ws_connect):
                     self.__logger.debug(f"建立第 {i + 1} 條連線")
-                    self.sdk.init_realtime()
-                    ws = self.sdk.marketdata.websocket_client.stock
-                    ws.on("connect", self.on_connect_callback)
-                    ws.on("disconnect", self.on_disconnect_callback)
-                    ws.on("error", self.on_error_callback)
-                    ws.on("message", self.__ws_on_message_handler)
-                    ws.connect()
 
-                    self.__ws_connections.append(ws)
-                    self.__ws_subscription_counts.append(0)
+                    # Doing the connection with timeout
+                    t = threading.Thread(target=self.__connection_operator)
+                    t.start()
+                    t.join(5)
+
+                    if t.is_alive():
+                        raise TimeoutError
 
                     time.sleep(0.2)
+                    self.__logger.debug(f"建立第 {i + 1} 條連線完畢")
 
                 self.__is_marketdata_ws_connect = True
-
+                self.__logger.debug(f"建立連線成功!")
                 return True
 
             except Exception as e:
                 self.__logger.debug(f"Marketdata ws connection exception {e}, will try to reconnect")
                 time.sleep(5)
-                return self.establish_marketdata_connection(retry_counter=retry_counter + 1, max_retry=max_retry)
+                return self.establish_marketdata_connection(retry_counter=retry_counter + 1, max_retry=max_retry,
+                                                            caller="self_retry")
 
     @check_is_terminated
     def subscribe_realtime_trades(self, symbol: str):
@@ -446,7 +484,7 @@ class SDKManager:
             return
 
         if not self.__ws_connections:
-            self.establish_marketdata_connection()
+            self.establish_marketdata_connection(caller=" subscribe_realtime_trades")
 
         # Subscribes
         min_num = min(self.__ws_subscription_counts)
@@ -495,10 +533,16 @@ class SDKManager:
     def set_ws_handle_func(self, func_name, func):
         """
         Set callback function to websocket marketdata
-        :param func_name: "message"
+        :param func_name: "connect", "disconnect", "error", or "message"
         :param func: The corresponding callback function
         """
         match func_name:
+            # case "connect":
+            #     self.on_connect_callback = func
+            # case "disconnect":
+            #     self.on_disconnect_callback = func
+            # case "error":
+            #     self.on_error_callback = func
             case "message":
                 self.on_message_callback = func
             case _:
@@ -516,10 +560,12 @@ class SDKManager:
     def set_trade_handle_func(self, func_name, func):
         """
         Set sdk trade callback function
-        :param func_name: "on_order", "on_order_changed", or "on_filled"
+        :param func_name: "on_event", "on_order", "on_order_changed", or "on_filled"
         :param func: The corresponding callback function
         """
         match func_name:
+            # case "on_event":
+            #     self.trade_ws_on_event = func
             case "on_order":
                 self.trade_ws_on_order = func
             case "on_order_changed":
@@ -554,6 +600,17 @@ class SDKManager:
         Callback wrappers
     """
 
+    def __ws_on_message_find_symbol_by_id(self, target_id):
+        try:
+            for symbol, values in self.__subscription_details.items():
+                if values[1] == target_id:
+                    return symbol
+        except Exception as e:
+            self.__logger.debug(f"__ws_on_message_find_symbol_by_id: error {e}")
+            return None
+
+        return None
+
     def __ws_on_message_handler(self, message):
         if self.on_message_callback is not None:
             if "pong" not in message:
@@ -565,20 +622,31 @@ class SDKManager:
                         symbol = msg["data"]["symbol"]
                         channel_id = msg["data"]["id"]
                         self.__async_lock_by_symbol[symbol] = asyncio.Lock()
+                        self.__latest_timestamp[symbol] = 0
                         self.__subscription_details[symbol][1] = channel_id
 
                     elif msg["event"] == "unsubscribed":
-                        symbol = msg["data"]["symbol"]
-                        ws_pos = self.__subscription_details[symbol][0]
+                        channel_id = msg["data"]["id"]
+                        symbol = self.__ws_on_message_find_symbol_by_id(channel_id)
 
-                        self.__ws_subscription_list.remove(symbol)  # Clear from the symbol list
-                        del self.__subscription_details[symbol]  # Clear from the detail dictionary
-                        self.__ws_subscription_counts[ws_pos] -= 1  # Reduce the counter
+                        if symbol is not None:
+                            ws_pos = self.__subscription_details[symbol][0]
 
-                        # Remove async lock
-                        del self.__async_lock_by_symbol[symbol]
+                            self.__ws_subscription_list.remove(symbol)  # Clear from the symbol list
+                            del self.__subscription_details[symbol]  # Clear from the detail dictionary
+                            self.__ws_subscription_counts[ws_pos] -= 1  # Reduce the counter
+
+                            # Remove async lock
+                            del self.__async_lock_by_symbol[symbol]
+                            del self.__latest_timestamp[symbol]
+                        else:
+                            self.__logger.debug(f"Cannot find the id")
 
                     elif msg["event"] == "heartbeat":
+                        time_now = time.time()
+                        if time_now > self.__heartbeat_timestamp:
+                            self.__heartbeat_timestamp = time_now
+
                         self.__logger.debug(f"marketdata - {message}")
 
                     # Pass the message to the custom callback function
@@ -598,10 +666,12 @@ class SDKManager:
 
                 if symbol in self.__async_lock_by_symbol.keys():
                     async with self.__async_lock_by_symbol[symbol]:
-                        if symbol not in self.__latest_timestamp.keys() or \
-                                timestamp > self.__latest_timestamp[symbol]:
+                        if timestamp > self.__latest_timestamp[symbol]:
                             self.__latest_timestamp[symbol] = timestamp
                             self.on_message_callback(message["data"])
+                        else:
+                            pass
+                            #self.__logger.debug(f"{symbol} price data is outdated, ignore. Data\n{message['data']}")
 
         except Exception as e:
             self.__logger.error(f"__ws_on_message_handler_task error: error - {e}, message - {message}")
