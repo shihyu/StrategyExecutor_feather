@@ -1,13 +1,16 @@
+# import os
 import logging
 import asyncio
 import threading
 import time
+import traceback
 import utils
 import datetime
 import functools
 import json
+# import inspect
 from zoneinfo import ZoneInfo
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 import fubon_neo
 from fubon_neo.sdk import FubonSDK
 
@@ -28,17 +31,22 @@ def check_sdk(func):
 
 
 class SDKManager:
-    __version__ = "2024.2.0"
+    __version__ = "2024.10.2"
 
     def __init__(self, max_marketdata_ws_connect=1, logger=None, log_level=logging.DEBUG):
         # Set logger
+        log_shutdown_event = None
         if logger is None:
             utils.mk_folder("log")
             current_date = datetime.datetime.now(ZoneInfo("Asia/Taipei")).date().strftime("%Y-%m-%d")
-            logger = utils.get_logger(name="SDKManager", log_file=f"log/sdkmanager_{current_date}.log",
-                                      log_level=log_level)
+            logger,log_shutdown_event = utils.get_logger(
+                name="SDKManager",
+                log_file=f"log/sdkmanager_{current_date}.log",
+                log_level=log_level
+            )
 
         self.__logger = logger
+        self.__logger_shutdown = log_shutdown_event
 
         # Credential data
         self.__id = None
@@ -49,7 +57,7 @@ class SDKManager:
         self.__active_account_no = None
 
         # SDK and account info
-        self.sdk: Optional[FubonSDK] = None
+        self.sdk: FubonSDK | None = None
         self.accounts = None
         self.active_account = None
         self.trade_ws_on_event = lambda code, msg: self.__logger.debug(f"Trade ws event: code {code}, msg {msg}")
@@ -69,12 +77,16 @@ class SDKManager:
         self.on_disconnect_callback = self.handle_marketdata_ws_disconnect
         self.on_error_callback = lambda error: self.__logger.debug(f"Marketdata ws error: err {error}")
         self.on_message_callback = lambda msg: self.__logger.debug(f"marketdata ws msg: {msg}")
+        self.__ws_message_queue: asyncio.Queue | None = None
 
         self.__is_marketdata_ws_connect = False
         self.__max_marketdata_ws_connect = max(min(5, int(max_marketdata_ws_connect)), 1)
         self.__logger.info(f"max_marketdata_ws_connect setting: {self.__max_marketdata_ws_connect}")
 
         self.__heartbeat_timestamp = time.time()
+
+        # Threadpool executor
+        self.__threadpool_executor = ThreadPoolExecutor()
 
         # Callback lock
         self.__process_lock = threading.Lock()
@@ -91,14 +103,20 @@ class SDKManager:
         self.__is_terminate = False
         self.__termination_initiated = False
         self.__relogin_lock = threading.Lock()
+        self.__realtime_data_processing_locks = {}
 
         # Async
+        self.__trade_message_queue = asyncio.Queue()
         self.__event_loop = asyncio.new_event_loop()
-        self.__async_thread = threading.Thread(
-            target=self.__event_loop.run_until_complete,
-            args=(self.__async_keep_running(),)
+        # self.__async_thread = threading.Thread(
+        #     target=self.__event_loop.run_until_complete,
+        #     args=(self.__async_keep_running(),)
+        # )
+        # self.__async_thread.start()
+        self.__async_thread = self.__threadpool_executor.submit(
+            self.__event_loop.run_until_complete,
+            self.__async_keep_running()
         )
-        self.__async_thread.start()
         self.__logger.debug(f"Async loop started ...")
 
         self.__async_lock_by_symbol = {}  # {symbol -> the lock}
@@ -113,19 +131,27 @@ class SDKManager:
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             if self.__is_terminate:
-                self.__logger.error("This SDKManager has been terminated. Please start a new one.")
+                print("This SDKManager has been terminated. Please start a new one.")
             else:
                 return func(self, *args, **kwargs)
 
         return wrapper
 
     async def __async_keep_running(self):
+        # Initialize the trade message queue manager
+        #asyncio.ensure_future(self.__ws_on_message_handler_queue_manager())
+
+        # Keep running
         try:
             while True:
                 time_now = time.time()
                 if time_now - self.__heartbeat_timestamp > 90:
-                    threading.Thread(target=self.handle_marketdata_ws_disconnect,
-                                     args=(-1, "Heartbeat lost ...")).start()
+                    # threading.Thread(target=self.handle_marketdata_ws_disconnect,
+                    #                  args=(-1, "Heartbeat lost ...")).start()
+                    self.__threadpool_executor.submit(
+                        self.handle_marketdata_ws_disconnect,
+                        -1, "Heartbeat lost ..."
+                    )
                     self.__heartbeat_timestamp = time.time()
                 await asyncio.sleep(5)
         except asyncio.CancelledError:
@@ -211,9 +237,12 @@ class SDKManager:
                 for task in tasks:
                     task.cancel()
 
-                self.__async_thread.join(5)
+                # self.__async_thread.join(5)
+                self.__async_thread.result(timeout=5)
                 self.__event_loop.close()
                 self.__logger.debug("The async event loop closed.")
+                self.__threadpool_executor.shutdown(wait=False, cancel_futures=True)
+                self.__logger.debug("The threadpool_executor shutdown.")
 
                 # Disconnect marketdata ws
                 for ws in self.__ws_connections:
@@ -225,6 +254,8 @@ class SDKManager:
 
             finally:
                 self.__is_terminate = True
+                if self.__logger_shutdown is not None:
+                    self.__logger_shutdown.set()
 
     def is_login(self):
         result = False if self.sdk is None else True
@@ -284,8 +315,12 @@ class SDKManager:
                 self.__is_relogin_running = False
 
                 # reconnect marketdata
-                threading.Thread(target=self.handle_marketdata_ws_disconnect,
-                                 args=(-9000, "Trade ws reconnected")).start()
+                # threading.Thread(target=self.handle_marketdata_ws_disconnect,
+                #                  args=(-9000, "Trade ws reconnected")).start()
+                self.__threadpool_executor.submit(
+                    self.handle_marketdata_ws_disconnect,
+                    -9000, "Trade ws reconnected"
+                )
 
                 return True
 
@@ -322,12 +357,14 @@ class SDKManager:
     def is_alive(self):
         return self.__is_alive
 
+    def is_terminated(self):
+        return self.__is_terminate
+
     """
         Marketdata WebSocket
     """
 
     def __handle_trade_ws_event(self, code, message):
-        print(f"trade_ws_event code {code}, message {message}")
         if code in ["300"]:
             if self.__termination_initiated:
                 self.__logger.info(f"交易連線異常，啟動重新連線 ..., code {code}")
@@ -351,13 +388,18 @@ class SDKManager:
         self.__logger.debug(f"Marketdata ws disconnected. code {code}, msg {message}")
         self.__is_marketdata_ws_connect = False
 
-        t = threading.Thread(
-            target=self.__handle_marketdata_ws_disconnect_threading,
-            args=(code, message)
-        )
+        # t = threading.Thread(
+        #     target=self.__handle_marketdata_ws_disconnect_threading,
+        #     args=(code, message)
+        # )
+        # t.start()
+        # t.join()
 
-        t.start()
-        t.join()
+        future = self.__threadpool_executor.submit(
+            self.__handle_marketdata_ws_disconnect_threading,
+            code, message
+        )
+        future.result()
 
     def __handle_marketdata_ws_disconnect_threading(self, code, message):
         with self.__process_lock:
@@ -430,14 +472,22 @@ class SDKManager:
 
             # Disconnect all current websocket if any
             for ws in self.__ws_connections:
-                t = threading.Thread(target=ws.disconnect)
+                # t = threading.Thread(target=ws.disconnect)
+                t = self.__threadpool_executor.submit(
+                    ws.disconnect
+                )
+
                 disconnect_threads.append(t)
 
             for t in disconnect_threads:
-                t.start()
+                t.result()
+            # for t in disconnect_threads:
+            #     t.start()
+            #
+            # for t in disconnect_threads:
+            #     t.join()
 
-            for t in disconnect_threads:
-                t.join()
+
 
         except Exception as e:
             self.__logger.debug(f"Marketdata ws exception: {e}")
@@ -455,11 +505,15 @@ class SDKManager:
                     self.__logger.debug(f"建立第 {i + 1} 條連線")
 
                     # Doing the connection with timeout
-                    t = threading.Thread(target=self.__connection_operator)
-                    t.start()
-                    t.join(5)
+                    # t = threading.Thread(target=self.__connection_operator)
+                    # t.start()
+                    # t.join(5)
+                    t = self.__threadpool_executor.submit(
+                        self.__connection_operator
+                    )
+                    t.result(timeout=5)
 
-                    if t.is_alive():
+                    if not t.done():
                         raise TimeoutError
 
                     time.sleep(0.2)
@@ -508,6 +562,7 @@ class SDKManager:
         self.__ws_subscription_counts[pos] += 1
         self.__ws_subscription_list.append(symbol)
         self.__subscription_details[symbol] = [pos, None]
+        self.__realtime_data_processing_locks[symbol] = asyncio.Lock()
 
     @check_is_terminated
     def unsubscribe_realtime_trades(self, symbol: str):
@@ -543,11 +598,11 @@ class SDKManager:
             #     self.on_disconnect_callback = func
             # case "error":
             #     self.on_error_callback = func
-            case "message":
-                self.on_message_callback = func
+            # case "message":
+            #     self.on_message_callback = func
             case _:
                 self.__logger.error(f"Undefined function name {func_name}")
-                return
+                # return
 
         # Set callbacks
         for ws in self.__ws_connections:
@@ -555,6 +610,10 @@ class SDKManager:
             ws.on("disconnect", self.on_disconnect_callback)
             ws.on("error", self.on_error_callback)
             ws.on("message", self.__ws_on_message_handler)
+
+    @check_is_terminated
+    def set_ws_message_handle_queue(self, queue: asyncio.Queue):
+        self.__ws_message_queue = queue
 
     @check_is_terminated
     def set_trade_handle_func(self, func_name, func):
@@ -612,66 +671,126 @@ class SDKManager:
         return None
 
     def __ws_on_message_handler(self, message):
-        if self.on_message_callback is not None:
-            if "pong" not in message:
-                try:
-                    msg = json.loads(message)  # Loads json str to dictionary
+        # if self.on_message_callback is not None:
+        if "pong" not in message:
+            try:
+                time_now = time.time()
+                msg = json.loads(message)  # Loads json str to dictionary
 
-                    # subscription detail update
-                    if msg["event"] == "subscribed":
-                        symbol = msg["data"]["symbol"]
-                        channel_id = msg["data"]["id"]
-                        self.__async_lock_by_symbol[symbol] = asyncio.Lock()
-                        self.__latest_timestamp[symbol] = 0
-                        self.__subscription_details[symbol][1] = channel_id
+                if (msg["event"] == "data") and (self.__ws_message_queue is not None):
+                    # if self.on_message_callback is not None:
+                    #     # Pass the message to the custom callback function
+                    #     # self.__event_loop.create_task(
+                    #     #     self.__ws_on_message_handler_task(msg, time_now)
+                    #     # )
+                    #     try:
+                    #         self.__trade_message_queue.put_nowait([msg, time_now])
+                    #
+                    #     except asyncio.QueueFull as e:
+                    #         self.__logger.warning(f"self.__trade_message_queue is full! Exception: {e}")
+                    msg["data"]["ws_received_time"] = time_now
+                    msg["data"]["ws_latency"] = time_now - int(msg["data"]["time"]) / 1000000
+                    try:
+                        self.__ws_message_queue.put_nowait(msg["data"])
+                    except asyncio.QueueFull as e:
+                        self.__logger.warning(f"self.__trade_message_queue is full! Exception: {e}")
+                    except Exception as e:
+                        self.__logger.error(f"self.__trade_message_queue Exception: {e}, " +
+                                            f"traceback:\n{traceback.format_exc()}")
 
-                    elif msg["event"] == "unsubscribed":
-                        channel_id = msg["data"]["id"]
-                        symbol = self.__ws_on_message_find_symbol_by_id(channel_id)
+                elif msg["event"] == "subscribed":  # subscription detail update
+                    symbol = msg["data"]["symbol"]
+                    channel_id = msg["data"]["id"]
+                    self.__async_lock_by_symbol[symbol] = asyncio.Lock()
+                    self.__latest_timestamp[symbol] = 0
+                    self.__subscription_details[symbol][1] = channel_id
 
-                        if symbol is not None:
-                            ws_pos = self.__subscription_details[symbol][0]
+                elif msg["event"] == "unsubscribed":
+                    channel_id = msg["data"]["id"]
+                    symbol = self.__ws_on_message_find_symbol_by_id(channel_id)
 
-                            self.__ws_subscription_list.remove(symbol)  # Clear from the symbol list
-                            del self.__subscription_details[symbol]  # Clear from the detail dictionary
-                            self.__ws_subscription_counts[ws_pos] -= 1  # Reduce the counter
+                    if symbol is not None:
+                        ws_pos = self.__subscription_details[symbol][0]
 
-                            # Remove async lock
-                            del self.__async_lock_by_symbol[symbol]
-                            del self.__latest_timestamp[symbol]
-                        else:
-                            self.__logger.debug(f"Cannot find the id")
+                        self.__ws_subscription_list.remove(symbol)  # Clear from the symbol list
+                        del self.__subscription_details[symbol]  # Clear from the detail dictionary
+                        self.__ws_subscription_counts[ws_pos] -= 1  # Reduce the counter
 
-                    elif msg["event"] == "heartbeat":
-                        time_now = time.time()
-                        if time_now > self.__heartbeat_timestamp:
-                            self.__heartbeat_timestamp = time_now
+                        # Remove async lock
+                        del self.__async_lock_by_symbol[symbol]
+                        del self.__latest_timestamp[symbol]
+                    else:
+                        pass
+                        # self.__logger.debug(f"Cannot find the id")
 
-                        self.__logger.debug(f"marketdata - {message}")
+                elif msg["event"] == "heartbeat":
+                    if time_now > self.__heartbeat_timestamp:
+                        self.__heartbeat_timestamp = time_now
 
-                    # Pass the message to the custom callback function
-                    self.__event_loop.create_task(
-                        self.__ws_on_message_handler_task(msg)
-                    )
+                    latency = time_now - float(msg["data"]["time"]) / 1000000
+                    self.__logger.debug(f"marketdata - {message}, latency: {latency:.6f} s")
 
-                except Exception as e:
-                    self.__logger.error(f"__ws_on_message_handler error: {e}, msg = {message}")
+            except Exception as e:
+                self.__logger.error(f"__ws_on_message_handler error: {e}, msg = {message}, " +
+                                    f"traceback:\n{traceback.format_exc()}")
 
-    async def __ws_on_message_handler_task(self, message: dict):
-        try:
-            if message["event"] == "data":
-                data = message["data"]
-                symbol = data["symbol"]
-                timestamp = int(data["time"])
+    # async def __ws_on_message_handler_queue_manager(self):
+    #     while not self.__is_terminate:
+    #         item = await self.__trade_message_queue.get()
+    #
+    #         try:
+    #             # Retrieve information
+    #             message = item[0]
+    #             received_time = item[1]
+    #             message["data"]["ws_received_time"] = received_time
+    #             message["data"]["ws_latency"] = received_time - int(message["data"]["time"]) / 1000000
+    #
+    #             if inspect.iscoroutinefunction(self.on_message_callback):
+    #                 # If it's an async function, await it directly
+    #                 asyncio.ensure_future(self.on_message_callback(message["data"]))
+    #             else:
+    #                 # If it's a regular function, run it in the executor
+    #                 self.__event_loop.run_in_executor(
+    #                     self.__threadpool_executor,
+    #                     self.on_message_callback,
+    #                     message["data"]
+    #                 )
+    #
+    #         except Exception as e:
+    #             self.__logger.debug(f"__ws_on_message_handler_queue_manager exception: {e}, " +
+    #                                 f"traceback:\n{traceback.format_exc()}")
 
-                if symbol in self.__async_lock_by_symbol.keys():
-                    async with self.__async_lock_by_symbol[symbol]:
-                        if timestamp > self.__latest_timestamp[symbol]:
-                            self.__latest_timestamp[symbol] = timestamp
-                            self.on_message_callback(message["data"])
-                        else:
-                            pass
-                            #self.__logger.debug(f"{symbol} price data is outdated, ignore. Data\n{message['data']}")
-
-        except Exception as e:
-            self.__logger.error(f"__ws_on_message_handler_task error: error - {e}, message - {message}")
+    # async def __ws_on_message_handler_task(self, message: dict, received_time: float):
+    #     try:
+    #         data = message["data"]
+    #         symbol = data["symbol"]
+    #         lock = self.__realtime_data_processing_locks[symbol]
+    #     except Exception as e:
+    #         self.__logger.error(f"__ws_on_message_handler_task err: {e}, traceback:\n{traceback.format_exc()}")
+    #         return
+    #
+    #     if await lock.acquire(timeout=0):
+    #         try:
+    #             timestamp = int(data["time"])
+    #
+    #             message["data"]["ws_received_time"] = received_time
+    #             message["data"]["ws_latency"] = received_time - timestamp / 1000000
+    #
+    #             if inspect.iscoroutinefunction(self.on_message_callback):
+    #                 # If it's an async function, await it directly
+    #                 await self.on_message_callback(message["data"])
+    #             else:
+    #                 # If it's a regular function, run it in the executor
+    #                 await self.__event_loop.run_in_executor(
+    #                     self.__threadpool_executor,
+    #                     self.on_message_callback,
+    #                     message["data"]
+    #                 )
+    #
+    #         except Exception as e:
+    #             self.__logger.error(f"__ws_on_message_handler_task error: error - {e}, message - {message}")
+    #
+    #         finally:
+    #             lock.release()
+    #     else:
+    #         self.__logger.debug(f"Cannot acquire lock, pass processing the data:\n{data}")

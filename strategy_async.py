@@ -1,0 +1,1312 @@
+import asyncio
+import os
+import multiprocessing
+import sys
+import time
+import logging
+import json
+import utils
+import datetime
+import random
+import traceback
+from queue import Empty, Full
+from abc import ABC, abstractmethod
+from zoneinfo import ZoneInfo
+from sdk_manager_async import SDKManager, check_sdk
+from dotenv import load_dotenv
+from fubon_neo.sdk import Order
+from fubon_neo.constant import TimeInForce, OrderType, PriceType, MarketType, BSAction
+from concurrent.futures import ThreadPoolExecutor
+
+
+class Strategy(ABC):
+    """
+    Strategy template class
+    """
+    __version__ = "2024.0.7"
+
+    def __init__(self, logger=None, log_level=logging.DEBUG):
+        # Set logger
+        log_shutdown_event = None
+        if logger is None:
+            current_date = datetime.datetime.now(ZoneInfo("Asia/Taipei")).date().strftime("%Y-%m-%d")
+            utils.mk_folder("log")
+            logger, log_shutdown_event = utils.get_logger(
+                name="Strategy",
+                log_file=f"log/strategy_{current_date}.log",
+                log_level=log_level
+            )
+
+        self.logger = logger
+        self.logger_shutdown = log_shutdown_event
+
+        # The sdk_manager
+        self.sdk_manager: SDKManager | None = None
+
+        # Coordination
+        # self.__is_strategy_run = False
+
+    """
+        Public Functions
+    """
+
+    def set_sdk_manager(self, sdk_manager: SDKManager):
+        self.sdk_manager = sdk_manager
+        self.logger.info(f"The SDKManager version: {self.sdk_manager.__version__}")
+
+    @check_sdk
+    def add_realtime_marketdata(self, symbol: str):
+        """
+         Add a realtime trade data websocket channel
+        :param symbol: stock symbol (e.g., "2881")
+        """
+        self.sdk_manager.subscribe_realtime_trades(symbol)
+
+    @check_sdk
+    def remove_realtime_marketdata(self, symbol: str):
+        """
+        Remove a realtime market data websocket channel
+        :param symbol: stock symbol (e.g., "2881")
+        """
+        self.sdk_manager.unsubscribe_realtime_trades(symbol)
+
+    @abstractmethod
+    @check_sdk
+    def run(self):
+        """
+        Strategy logic to be implemented.
+        """
+        raise NotImplementedError("Subclasses must implement this method")
+
+
+class TradingHeroAlpha(Strategy):
+    __version__ = "2024.11.1"
+
+    def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
+        super().__init__(logger=logger, log_level=log_level)
+
+        # Multiprocessing queue
+        self.queue: multiprocessing.Queue = the_queue
+
+        # Setup target symbols
+        self.__symbols = ['1524', '4127', '4555', '5481', '8182', '1220', '2641',
+                          '6208', '3713', '3294', '3083', '6770', '4168', '4153',
+                          '6834', '4540', '6270', '4123', '3540', '2331', '6229',
+                          '1762', '1789', '4157', '3492', '2613', '3317', '8044',
+                          '6742', '4931', '8110', '6141', '8277', '00654R', '6228',
+                          '00756B', '5410', '1817', '1339', '4523']
+
+        self.__symbols_task_done = []
+
+        # Price data
+        self.__lastday_close = {}
+        self.__open_price_today = {}
+        self.__ws_message_queue = asyncio.Queue()
+
+        self.__trail_stop_profit_cutoff: dict[str, float] | None = None
+
+        # Order coordinators
+        self.__position_info = {}
+        self.__is_reload = False  # If the program start with reload mode
+        utils.mk_folder("position_info_store")
+        self.__pos_info_file_path = \
+            f"position_info_store/position_info_{datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d')}.json"
+        # Check if the file exists
+        if os.path.exists(self.__pos_info_file_path):
+            # Load the dictionary from the JSON file
+            with open(self.__pos_info_file_path, 'r') as f:
+                self.__position_info = json.load(f)
+            self.logger.info(f"Loaded position_info from file:\n {self.__position_info}")
+            self.__is_reload = True
+
+        self.__open_order_placed = {}
+        self.__closure_order_placed = {}
+
+        self.__on_going_orders = {}  # {symbol -> [order_no]}
+        self.__order_type_enter = {}
+        self.__order_type_exit = {}
+        self.__on_going_orders_lock: dict[str, asyncio.Lock] | None = None
+        self.__max_latest_price_timestamp = 0 if not self.__is_reload else time.time()
+
+        self.__failed_order_count = {}
+        self.__failed_exit_order_count = {}
+        self.__clean_list = []
+
+        self.__suspend_entering_symbols = []
+
+        self.__price_data_queue_symbol: dict[str, asyncio.Queue] | None = None
+        self.__price_data_processor_tasks = []
+
+        for s in self.__symbols:
+            self.__on_going_orders[s] = []
+            self.__order_type_enter[s] = []
+            self.__order_type_exit[s] = []
+            #self.__on_going_orders_lock[s] = asyncio.Lock()
+
+        # Position sizing
+        self.__fund_available = 600000
+        self.__enter_lot_limit = 3
+        self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
+        self.__fund_available_update_lock = asyncio.Lock()
+        self.__active_target_list = []
+        self.logger.info(f"初始可用額度: {self.__fund_available} TWD")
+        self.logger.info(f"個股下單上限: {self.__enter_lot_limit} 張")
+
+        # Strategy checkpoint
+        minute_digit_offset = [-2, -1, 0, 1, 2]
+        second_digit_offset = [*range(-25, 26, 1)]
+        self.__strategy_exit_time = datetime.time(13, int(16 + random.choice(minute_digit_offset)),
+                                                  int(30 + random.choice(second_digit_offset)))
+        self.__strategy_enter_cutoff_time = datetime.time(9, 6)
+        self.__market_close_time = datetime.time(13, 32)
+        self.__is_market_close_time_passed = False  # Flag for using self.__price_data_queue_handler()
+
+        # ThreadPoolExecutor
+        self.__threadpool_executor = ThreadPoolExecutor()
+
+        # The async loops
+        self.__event_loop: asyncio.events.AbstractEventLoop | None = None
+        #self.__price_data_queue_event_loop: asyncio.events.AbstractEventLoop = asyncio.new_event_loop()
+
+    def __flush_position_info(self):
+        # Send message to the multiprocessing queue
+        message = {
+            "event": "position_info",
+            "data": self.__position_info
+        }
+        try:
+            self.queue.put_nowait(message)
+        except Full:
+            self.logger.warning("Supervisor's queue is full ...")
+
+    def __self_restart(self):
+        message = {
+            "event": "restart",
+            "data": None
+        }
+        self.queue.put(message)
+
+    async def __heartbeat_task(self):
+        now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        while now_time < self.__market_close_time:
+            self.__emit_heartbeat()
+
+            price_waiting_time = time.time() - self.__max_latest_price_timestamp / 1000000
+            if (price_waiting_time > 300) and \
+                    (self.__position_info or
+                     (datetime.time(8, 30) < now_time < datetime.time(9, 0))):
+                message = {
+                    "event": "warning",
+                    "data": price_waiting_time
+                }
+                try:
+                    self.queue.put_nowait(message)
+                except Full:
+                    self.logger.warning("Supervisor's queue is full ...")
+
+            # Prepare the next run
+            await asyncio.sleep(5)
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        # Update the flag
+        self.__is_market_close_time_passed = True
+
+    def __emit_heartbeat(self):
+        # Update the multiprocessing queue
+        message = {
+            "event": "strategy_heartbeat",
+            "data": time.time()
+        }
+        try:
+            self.queue.put_nowait(message)
+        except Full:
+            self.logger.warning("Supervisor's queue is full ...")
+
+    async def __place_order(self, order):
+        place_order_start_time = time.time()
+
+        response = self.sdk_manager.sdk.stock.place_order(
+            self.sdk_manager.active_account,
+            order,
+            unblock=False,
+        )
+
+        place_order_end_time = time.time()
+
+        return response, place_order_start_time, place_order_end_time
+
+    @check_sdk
+    def run(self):
+        # Startup async event loops
+        asyncio.run(self.async_run())
+        # threads = [threading.Thread(target=self.__event_loop.run_until_complete, args=(self.async_run(),)),
+        #            threading.Thread(
+        #                target=self.__price_data_queue_event_loop.run_until_complete,
+        #                args=(self.__price_data_queue_handler(),))]
+        #
+        # for t in threads:
+        #     t.start()
+        #
+        # for t in threads:
+        #     t.join()
+
+        # Finishing ...
+        self.__threadpool_executor.shutdown(wait=False, cancel_futures=True)
+        #self.__price_data_queue_event_loop.close()
+        self.__event_loop.close()
+        self.logger_shutdown.set()
+
+    async def async_run(self):
+        # Record the event loop
+        self.__event_loop = asyncio.get_event_loop()
+        heartbeat_task = self.__event_loop.create_task(self.__heartbeat_task())
+
+        # Get stock's last day close price
+        rest_stock = self.sdk_manager.sdk.marketdata.rest_client.stock
+
+        self.logger.info("Strategy.run - Getting stock close price of the last trading day ...")
+        for s in self.__symbols:
+            response = rest_stock.intraday.quote(symbol=s)
+            self.__lastday_close[s] = float(response["previousClose"])
+            await asyncio.sleep(0.1)
+
+        # Set callback functions
+        self.sdk_manager.set_trade_handle_func("on_filled", self.__order_filled_processor)
+        #self.sdk_manager.set_ws_handle_func("message", self.__realtime_price_data_processor)  # Marketdata
+        self.sdk_manager.set_ws_message_handle_queue(self.__ws_message_queue)
+        queue_handler = self.__event_loop.create_task(self.__price_data_queue_handler())
+
+        # Remove symbols that can do day-trade short sell
+        self.logger.debug("Strategy.run - Cleaning symbol list ...")
+
+        if self.sdk_manager.sdk_version >= (1, 3, 1):
+            candidate_symbols = self.__symbols.copy()
+            self.__symbols = []
+
+            for symbol in candidate_symbols:
+                query = self.sdk_manager.sdk.stock.daytrade_and_stock_info(self.sdk_manager.active_account, symbol)
+                retry_attempt_count = 0
+                is_success = False
+
+                while not is_success:
+                    if retry_attempt_count >= 2:
+                        self.logger.info(
+                            f"Failed to retrieve daytrade info for {symbol} too many time, skip this target")
+                        break  # Proceed to the next symbol
+
+                    elif not query.is_success:
+                        self.logger.debug(f"Fail retrieving daytrade info for {symbol}, retry later ...")
+                        retry_attempt_count += 1
+
+                    else:
+                        try:
+                            if (query.data.status is not None) and (int(query.data.status) >= 8):
+                                self.logger.debug(f"{symbol}'s status {query.data.status}, add to the list")
+                                self.__symbols.append(symbol)
+                            else:
+                                self.logger.info(
+                                    f"{symbol}'s daytrade status: {query.data.status}, remove from the list")
+
+                            is_success = True
+                            break  # Proceed to the next symbol
+
+                        except Exception as err:
+                            self.logger.error(f"{symbol} - query {query}")
+                            self.logger.error(
+                                f"Daytrade info query exception {err}, traceback {traceback.format_exc()}," +
+                                f" retry ...")
+                            retry_attempt_count += 1
+
+                    # Wait and retry
+                    await asyncio.sleep(0.2)
+                    query = self.sdk_manager.sdk.stock.daytrade_and_stock_info(self.sdk_manager.active_account, symbol)
+
+            self.logger.debug(f"Original symbol list (length {len(candidate_symbols)}):\n {candidate_symbols}")
+            self.logger.info(f"Refined symbol list (length {len(self.__symbols)}):\n {self.__symbols}")
+
+        else:
+            self.logger.debug(
+                f"SDK version is less than 1.3.1, current {self.sdk_manager.sdk_version}, ignore symbol cleaning ...")
+
+        self.logger.info("Strategy.run - Initialize price data queue and processing tasks per symbol ...")
+
+        self.__price_data_queue_symbol = {symbol: asyncio.Queue() for symbol in self.__symbols}
+        self.__price_data_processor_tasks = [self.__event_loop.create_task(self.__realtime_price_data_processor(symbol))
+                                             for symbol in self.__symbols]
+        self.__on_going_orders_lock = {symbol: asyncio.Lock() for symbol in self.__symbols}
+        self.__trail_stop_profit_cutoff = {symbol: -999 for symbol in self.__symbols}
+
+        self.logger.debug("Strategy.run - Subscribing realtime market datafeed ...")
+
+        # Subscribe realtime marketdata
+        futures = [
+            self.__event_loop.run_in_executor(
+                self.__threadpool_executor,
+                self.add_realtime_marketdata,
+                symbol
+            )
+            for symbol in self.__symbols
+        ]
+
+        # Await all futures
+        await asyncio.gather(*futures)
+
+        self.logger.debug("Strategy.run - Market data preparation has completed.")
+
+        # Order update agents
+        t = asyncio.create_task(self.__order_status_updater())
+
+        # Position sizing agent
+        tps = asyncio.create_task(self.__position_sizing_agent())
+
+        await self.__position_closure_executor()  # Position closure agent
+        await tps
+        await t
+        await heartbeat_task
+        await queue_handler
+        await asyncio.gather(*self.__price_data_processor_tasks)
+
+        self.logger.debug(f"async run finished ...")
+
+    async def __position_sizing_agent(self):
+        """
+            Add 6 more symbols every 1 second after market open
+        """
+        now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        while now_time < datetime.time(8, 59, 58):
+            await asyncio.sleep(1)
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        self.logger.debug(f"開始啟動加入進場標的 (time {now_time}) ...")
+
+        while now_time < datetime.time(9, 5, 15):
+            if len(self.__active_target_list) == len(self.__symbols):
+                break
+
+            i = 0
+            for symbol in self.__symbols:
+                if i > 6:
+                    break
+
+                if symbol not in self.__active_target_list:
+                    self.__active_target_list.append(symbol)
+                    i += 1
+
+            # self.logger.debug(f"現有進場標的列表 (time {now_time}): {self.__active_target_list}")
+
+            await asyncio.sleep(1)
+
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        # All symbol included
+        self.__active_target_list = self.__symbols
+        self.logger.debug(f"全進場標的列表 (time {now_time}): {self.__active_target_list}")
+
+    async def __order_status_updater(self):
+        now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+        self.logger.info(f"Start __order_status_updater")
+
+        while now_time < self.__market_close_time:
+            # Check if anything to check
+            if not all(len(lst) == 0 for lst in self.__on_going_orders.values()):
+                # Get order results
+                try:
+                    the_account = self.sdk_manager.active_account
+
+                    response = await self.__event_loop.run_in_executor(
+                        self.__threadpool_executor,
+                        self.sdk_manager.sdk.stock.get_order_results,
+                        the_account
+                    )
+
+                    if response.is_success:
+                        data = response.data
+
+                        for d in data:
+                            try:
+                                order_no = str(d.order_no)
+                                symbol = str(d.stock_no)
+                                status = int(d.status)
+
+                                if status != 10:
+                                    if not self.__on_going_orders_lock[symbol].locked():
+                                        async with self.__on_going_orders_lock[symbol]:
+                                            try:
+                                                self.__on_going_orders[symbol].remove(order_no)
+                                                self.logger.debug(
+                                                    f"on_going_orders updated (order updater): symbol {symbol}, " +
+                                                    f"order_no {order_no}"
+                                                )
+                                            finally:
+                                                continue
+
+                            except Exception as err:
+                                self.logger.debug(f"__order_status_updater error (inner loop) - {err}")
+                            finally:
+                                continue
+
+                    else:
+                        self.logger.debug(f"__order_status_updater retrieve order results failed, " +
+                                          f"message {response.message}")
+
+                except Exception as err:
+                    self.logger.debug(f"__order_status_updater error - {err}")
+
+            # sleep
+            await asyncio.sleep(5)
+
+            # Update the time
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+    async def __position_closure_executor_symbol(self, symbol):
+        try:
+            async with self.__on_going_orders_lock[symbol]:
+                # DayTrade 全部出場
+                if int(self.__position_info[symbol]["size"]) >= 1000 and \
+                        (symbol not in self.__closure_order_placed) and \
+                        (not self.__on_going_orders[symbol]):
+                    self.logger.info(f"{symbol} 時間出場條件成立 ...")
+
+                    qty = int(self.__position_info[symbol]["size"])
+
+                    self.logger.debug(f"{symbol} 出場股數 {qty}")
+
+                    # Emit heartbeat
+                    self.__emit_heartbeat()
+
+                    # Trading
+                    while qty >= 1000:
+                        # Send order
+                        order = Order(
+                            buy_sell=BSAction.Buy,
+                            symbol=symbol,
+                            price=None,
+                            quantity=1000,
+                            market_type=MarketType.Common,
+                            price_type=PriceType.Market,
+                            time_in_force=TimeInForce.ROD,
+                            order_type=OrderType.Stock,
+                            user_def="hvl_close",
+                        )
+
+                        response, place_order_start_time, place_order_end_time = await self.__place_order(order)
+
+                        if response.is_success:
+                            self.logger.info(f"{symbol} 時間出場下單成功, size {qty}")
+                            self.logger.debug(f"速度 {1000*(place_order_end_time - place_order_start_time):.6f} ms, " +
+                                              f"非由行情觸發. Data:\n{response.data}")
+
+                            self.__closure_order_placed[symbol] = True
+
+                            # Update order_type_exit
+                            if symbol in self.__order_type_exit:
+                                self.__order_type_exit[symbol].append(response.data.order_no)
+                            else:
+                                self.__order_type_exit[symbol] = [response.data.order_no]
+
+                            # Update on_going_orders list
+                            if symbol in self.__on_going_orders:
+                                self.__on_going_orders[symbol].append(response.data.order_no)
+                            else:
+                                self.__on_going_orders[symbol] = [response.data.order_no]
+
+                            self.logger.debug(
+                                f"on_going_orders updated (closure): symbol {symbol}, " +
+                                f"order_no {response.data.order_no}"
+                            )
+
+                            # Update qty
+                            qty -= 1000
+                            self.logger.debug(f"{symbol} 剩餘出場股數 {qty}")
+
+                            # Pause
+                            sec_to_sleep = random.randint(5, 10)
+                            await asyncio.sleep(sec_to_sleep)
+
+                        else:
+                            self.logger.warning(
+                                f"{symbol} 時間出場下單失敗, size {qty}, msg: {response.message}")
+
+                            # OS error handling
+                            if ("Broken pipe" in response.message) or ("os error" in response.message):
+                                raise OSError
+
+                            break
+
+                else:
+                    self.logger.debug(f"時間出場條件\"未\"成立 ...")
+                    self.logger.debug(f"(Closure session) symbol {symbol}")
+                    self.logger.debug(f"(Closure session) position info: {self.__position_info}")
+                    self.logger.debug(
+                        f"(Closure session) closure order placed keys: {self.__closure_order_placed.keys()}")
+                    self.__clean_list.append(symbol)
+
+        except OSError as err:
+            self.logger.error(f"OS Error {err} while sending orders, restart the strategy subprocess ...")
+            self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+            self.__self_restart()
+
+        except Exception as err:
+            self.logger.error(f"__realtime_price_data_processor, error: {err}")
+            self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+
+    async def __position_closure_executor(self):
+        now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        while now_time < self.__market_close_time:
+            try:
+                if now_time > self.__strategy_exit_time:
+                    self.__clean_list = []
+
+                    symbols_to_check = set(self.__position_info.keys()).copy()  # Symbols for this round of iteration
+
+                    futures = [
+                        self.__position_closure_executor_symbol(symbol)
+                        for symbol in symbols_to_check
+                    ]
+
+                    # Await all futures
+                    await asyncio.gather(*futures)
+
+                    # Execute position info cleaning
+                    for symbol in self.__clean_list:
+                        try:
+                            del self.__position_info[symbol]
+                        finally:
+                            self.__event_loop.run_in_executor(
+                                self.__threadpool_executor,
+                                self.remove_realtime_marketdata,
+                                symbol
+                            )
+
+                            # Add the symbol to the task done list
+                            self.__symbols_task_done.append(symbol)
+
+                    # self.__flush_position_info() is not necessary here
+                    self.__clean_list = []
+
+            except Exception as err:
+                self.logger.debug(f"時間出場迴圈錯誤: {err}, traceback: {traceback.format_exc()}")
+
+            finally:
+                # sleep
+                await asyncio.sleep(1)
+
+                # Update the time
+                now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+        self.logger.debug(f"Position closure executor completed.")
+        self.__symbols_task_done = self.__symbols
+
+    async def __price_data_queue_handler(self):
+        self.logger.debug(f"__price_data_queue_handler start running ...")
+
+        while not self.__is_market_close_time_passed:
+            try:
+                data = await asyncio.wait_for(self.__ws_message_queue.get(), timeout=5)
+
+                # Update the newest timestamp over all symbols
+                timestamp = int(data["time"])
+                if timestamp > self.__max_latest_price_timestamp:
+                    self.__max_latest_price_timestamp = timestamp
+
+                # Determine if pass to further processing
+                is_continuous = True if "isContinuous" in data else False
+                is_open = True if "isOpen" in data else False
+
+                pass_data_flag = False
+                symbol = data["symbol"]
+
+                if is_open:
+                    pass_data_flag = True
+                elif is_continuous:
+                    stop_condition_zeta = False
+                    if symbol in self.__position_info:
+                        # Calculate pre-screen variables
+                        ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
+                            data["price"])  # Add if for robustness
+                        gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[symbol]
+                        stop_condition_zeta = (gap_until_now_pct >= 8)
+
+                    pass_data_flag = stop_condition_zeta or (not self.__on_going_orders_lock[symbol].locked())
+
+                # Pass the message for further processing (or not)
+                if pass_data_flag:
+                    try:
+                        self.__price_data_queue_symbol[symbol].put_nowait(data)
+                    except asyncio.QueueFull as err:
+                        self.logger.warning(f"Queue for {symbol} is full! err {err}")
+                    # self.__event_loop.create_task(self.__realtime_price_data_processor(data))
+                    # asyncio.ensure_future(self.__realtime_price_data_processor(data), loop=self.__event_loop)
+
+            except asyncio.TimeoutError:
+                pass
+
+            except Exception as err:
+                self.logger.debug(f"__price_data_queue_handler exception: {err}, traceback:\n{traceback.format_exc()}")
+
+            finally:
+                continue
+
+        self.logger.debug(f"__price_data_queue_handler finished ...")
+
+    # async def __realtime_price_data_processor(self, data):
+    async def __realtime_price_data_processor(self, symbol: str):
+        def order_success_routine(symbol, response, order_type):
+            try:
+                if order_type == "enter":
+                    order_type_list = self.__order_type_enter
+                elif order_type == "stop":
+                    order_type_list = self.__order_type_exit
+                else:
+                    raise ValueError
+
+                # Update the order_type_exit list
+                if symbol in order_type_list:
+                    order_type_list[symbol].append(response.data.order_no)
+                else:
+                    order_type_list[symbol] = [response.data.order_no]
+
+                # Update on_going_orders list
+                if symbol in self.__on_going_orders:
+                    self.__on_going_orders[symbol].append(response.data.order_no)
+                else:
+                    self.__on_going_orders[symbol] = [response.data.order_no]
+
+                self.logger.debug(
+                    f"on_going_orders updated ({order_type}): symbol {symbol}, " +
+                    f"order_no {response.data.order_no}"
+                )
+            except Exception as er:
+                self.logger.error(f"exit_order_success_routine failed! Exception: {er}, " +
+                                  f"traceback: {traceback.format_exc()}")
+
+        # ########################
+        #        Main body
+        # ########################
+        while symbol not in self.__symbols_task_done:
+            # Retrieve data
+            try:
+                data: dict | None = None
+                data = await asyncio.wait_for(
+                    self.__price_data_queue_symbol[symbol].get(), timeout=5
+                )
+
+                if data.get("symbol", "not likely") != symbol:
+                    raise Exception
+
+            except asyncio.TimeoutError:
+                continue
+
+            except KeyError as err:
+                self.logger.error(f"Symbol {symbol} is not in the queue, err {err}! Will not process this symbol.")
+                self.logger.debug(f"price data queue per symbol keys: {self.__price_data_queue_symbol.keys()}")
+                self.logger.debug(f"Traceback\n{traceback.format_exc()}")
+                break
+
+            except Exception as err:
+                self.logger.error(f"Symbol {symbol} retrieve data exception: {err}, " +
+                                  f"traceback\n{traceback.format_exc()}")
+                continue
+
+            # Trading logic
+            initialization_time = time.time()
+            # symbol = None
+            is_locked = False
+
+            try:
+                # Proceed to the trading logic
+                # symbol = data["symbol"]
+                is_continuous = True if "isContinuous" in data else False
+                is_open = True if "isOpen" in data else False
+
+                if is_open:
+                    self.logger.info(f"Market open {symbol}: {data}")
+
+                # Cutout stock that does not fit the open price goal
+                if (symbol not in self.__open_price_today) and \
+                        (is_open or is_continuous) and \
+                        ("price" in data) and (not self.__is_reload):
+
+                    self.__open_price_today[symbol] = float(data["price"])
+
+                    gap_change_pct = 100 * (self.__open_price_today[symbol] - self.__lastday_close[symbol]) \
+                                     / self.__lastday_close[symbol]
+
+                    if (gap_change_pct < 1) or (gap_change_pct > 6):  # Do not trade this target today
+                        self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的")
+                        self.__open_order_placed[symbol] = 99999
+                        self.__event_loop.run_in_executor(
+                            self.__threadpool_executor,
+                            self.remove_realtime_marketdata,
+                            symbol
+                        )
+                        self.__symbols_task_done.append(symbol)
+
+                        return
+
+                # Start trading logic =============
+                # if is_continuous or is_open:
+                #     # Try to acquire the lock and proceed
+                #     if (not self.__on_going_orders_lock[symbol].locked()) or stop_condition_zeta:
+                await self.__on_going_orders_lock[symbol].acquire()
+                is_locked = True
+
+                # Start processing this tick
+                now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
+
+                # 開盤動作
+                if (now_time < self.__strategy_enter_cutoff_time) and \
+                        (not self.__is_reload) and \
+                        (symbol not in self.__suspend_entering_symbols) and \
+                        (symbol not in self.__open_order_placed or
+                         self.__open_order_placed[symbol] < self.__enter_lot_limit):
+
+                    if symbol not in self.__active_target_list:
+                        self.logger.info(f"{symbol} 尚未納入進場列表: {self.__active_target_list}")
+
+                    elif ("bid" not in data) or (float(data["bid"]) == 0):
+                        self.logger.debug(f"{symbol} 進場判斷邏輯讀無 bid 價格, data:\n{data}")
+
+                    else:
+                        # Calculate price change
+                        try:
+                            baseline_price = data["price"] if "price" in data else data["bid"]
+
+                        except Exception as error:
+                            baseline_price = data["bid"]
+
+                            self.logger.debug(
+                                f"{symbol} read price exception {error}. data: {data}. " +
+                                f"Traceback: {traceback.format_exc()}"
+                            )
+
+                        price_change_pct_bid = 100 * (float(baseline_price) - self.__lastday_close[symbol]) / \
+                                               self.__lastday_close[symbol]
+
+                        # Check for entering condition
+                        quantity_to_bid = 0
+                        pre_allocate_fund = 0
+                        fund_lock_checkpoint_start = fund_lock_checkpoint_end = 0  # init the timer variables
+
+                        if 1 < price_change_pct_bid < 5:
+                            fund_lock_checkpoint_start = time.time()
+                            async with self.__fund_available_update_lock:
+                                fund_lock_checkpoint_end = time.time()
+                                max_share_possible = \
+                                    int((self.__fund_available / float(data["bid"])) / 1000) * 1000
+
+                                # Calculate quantity to bid
+                                if max_share_possible < 1000:
+                                    self.logger.info(f"剩餘可用額度不足, symbol {symbol}, price {data['bid']}, " +
+                                                     f"fund_available {self.__fund_available}")
+                                    self.logger.info(f"{symbol} 稍後再確認進場訊號 ...")
+
+                                else:
+                                    quantity_to_bid = int(self.__enter_lot_limit * 1000)
+                                    if symbol in self.__open_order_placed:
+                                        quantity_to_bid -= self.__open_order_placed[symbol] * 1000
+
+                                    self.logger.debug(f"{symbol} 剩餘下單量 {quantity_to_bid} 股")
+
+                                    if max_share_possible < quantity_to_bid:
+                                        self.logger.debug(f"剩餘額動不足進場 {symbol}: {quantity_to_bid} 股," +
+                                                          f" 調整下單量至 1 張")
+                                        quantity_to_bid = 1000
+
+                                    # Pre-allocate fund
+                                    scale_factor = min(quantity_to_bid, self.__max_lot_per_round * 1000)
+                                    pre_allocate_fund = scale_factor * float(baseline_price)
+                                    self.__fund_available -= pre_allocate_fund
+
+                                    self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
+                                    self.logger.info(f"可用額度更新: {self.__fund_available}")
+
+                        # 進場操作
+                        if quantity_to_bid >= 1000:
+                            self.logger.info(f"{symbol} 進場條件成立 ...")
+
+                            quantity_has_bid = 0  # Record how much has already been bid this time
+
+                            while quantity_to_bid >= 1000:
+                                order = Order(
+                                    buy_sell=BSAction.Sell,
+                                    symbol=symbol,
+                                    price=None,
+                                    quantity=1000,
+                                    market_type=MarketType.Common,
+                                    price_type=PriceType.Market,
+                                    time_in_force=TimeInForce.IOC,
+                                    order_type=OrderType.DayTrade,
+                                    user_def="hvl_enter",
+                                )
+
+                                response, place_order_start_time, place_order_end_time = await self.__place_order(order)
+
+                                if response.is_success:
+                                    self.logger.debug(f"{symbol} 下單成功! " + f"成功進場委託單直回:\n{response}")
+                                    self.logger.debug(
+                                        f"Fund lock checkpoint: {1000*(fund_lock_checkpoint_end - fund_lock_checkpoint_start):.6f} ms, " +
+                                        f"啟動洗價等待時間 {1000*(initialization_time - data['ws_received_time']):.6f} ms, " +
+                                        f"下單前置 {1000*(place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                        f"速度 {1000*(place_order_end_time - place_order_start_time):.6f} ms, " +
+                                        f"觸發行情資料:\n {data}"
+                                    )
+
+                                    # Update the order record
+                                    if symbol in self.__open_order_placed:
+                                        self.__open_order_placed[symbol] += 1
+                                    else:
+                                        self.__open_order_placed[symbol] = 1
+
+                                    self.logger.info(
+                                        f"{symbol} 進場下單成功, 總進場張數 {self.__open_order_placed[symbol]}")
+
+                                    # Update pre-allocated fund
+                                    pre_allocate_fund -= 1000 * float(baseline_price)
+                                    self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
+
+                                    # Execute the routine after a success order
+                                    order_success_routine(symbol, response, "enter")
+
+                                    # Update remain quantity_to_bid
+                                    quantity_to_bid -= 1000
+                                    quantity_has_bid += 1000
+
+                                    self.logger.debug(f"{symbol} 已下單 {quantity_has_bid} 股，" +
+                                                      f"剩餘下單量 {quantity_to_bid} 股")
+
+                                    # Bid max shares per round
+                                    if quantity_has_bid >= self.__max_lot_per_round * 1000:
+                                        break
+
+                                else:
+                                    self.logger.debug(f"失敗進場委託單直回:\n{response}\n觸發行情:\n{data}")
+
+                                    # OS error handling
+                                    if ("Broken pipe" in response.message) or ("os error" in response.message):
+                                        raise OSError
+
+                                    if symbol in self.__failed_order_count:
+                                        self.__failed_order_count[symbol] += 1
+                                    else:
+                                        self.__failed_order_count[symbol] = 1
+
+                                    if self.__failed_order_count[symbol] >= 2:
+                                        if (symbol in self.__open_order_placed) and \
+                                                (self.__open_order_placed[symbol] > 0):
+                                            self.logger.info(f"{symbol} 已進場 " +
+                                                             f"{self.__open_order_placed[symbol]} 張, " +
+                                                             f'剩餘量委託失敗次數過多取消')
+                                            self.logger.info(f"{symbol} 不再確認進場訊號 ...")
+                                            self.__suspend_entering_symbols.append(symbol)
+
+                                    else:
+                                        self.logger.info(f"{symbol} 進場下單失敗次數達 2 次且未進場，移除標的")
+                                        self.__open_order_placed[symbol] = 99999
+                                        self.__event_loop.run_in_executor(
+                                            self.__threadpool_executor,
+                                            self.remove_realtime_marketdata,
+                                            symbol
+                                        )
+                                        self.__symbols_task_done.append(symbol)
+
+                                    # Cancel ramin quantity_to_bid
+                                    quantity_to_bid = -99999
+
+                            # Adjust for actual used fund
+                            async with self.__fund_available_update_lock:
+                                self.__fund_available += pre_allocate_fund
+                                self.logger.info(f"{symbol} 實際運用差額: {pre_allocate_fund}")
+                                self.logger.info(f"可用額度更新: {self.__fund_available}")
+
+                elif (symbol not in self.__open_order_placed) and (not self.__is_reload):  # 今天完全沒進場
+                    self.logger.info(f"{symbol} 今日無進場，移除股價行情訂閱 ...")
+                    self.__event_loop.run_in_executor(
+                        self.__threadpool_executor,
+                        self.remove_realtime_marketdata,
+                        symbol
+                    )
+                    self.__symbols_task_done.append(symbol)
+
+                # 停損停利出場
+                if (now_time < self.__strategy_exit_time) and \
+                        (symbol in self.__position_info) and \
+                        (not self.__on_going_orders[symbol]):
+
+                    info = self.__position_info[symbol]
+                    sell_price = info["price"]
+                    ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
+                        data["price"])  # Add if for robustness
+
+                    is_early_session = now_time <= datetime.time(9, 30)
+                    current_pnl_pct = 100 * (sell_price - ask_price) / ask_price
+                    gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
+                        symbol]
+
+                    if (self.__trail_stop_profit_cutoff[symbol] < 0) and (current_pnl_pct >= 6):
+                        # Set the cutoff to the current_pnl_pct
+                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct
+                    elif (self.__trail_stop_profit_cutoff[symbol] > 0) and \
+                            (current_pnl_pct - self.__trail_stop_profit_cutoff[symbol] >= 1):
+                        # Rise the cutoff
+                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
+
+                    stop_condition_1 = is_early_session and (current_pnl_pct <= -5)
+                                       #((current_pnl_pct >= 8) or (current_pnl_pct <= -5))
+                    stop_condition_2 = (not is_early_session) and (current_pnl_pct <= -3)
+                                       #((current_pnl_pct >= 6) or (current_pnl_pct <= -3))
+                    stop_condition_zeta = (gap_until_now_pct >= 8)
+                    stop_condition_alpha = current_pnl_pct < self.__trail_stop_profit_cutoff[symbol]
+
+                    if stop_condition_zeta or stop_condition_1 or stop_condition_2 or stop_condition_alpha:
+                        self.logger.info(f"{symbol} 停損/停利條件成立 ...")
+
+                        if stop_condition_zeta:
+                            self.logger.info(f"{symbol} 漲幅達 {gap_until_now_pct} %, 斷然出場！")
+                            order = Order(
+                                buy_sell=BSAction.Buy,
+                                symbol=symbol,
+                                price=None,
+                                quantity=int(self.__position_info[symbol]["size"]),
+                                market_type=MarketType.Common,
+                                price_type=PriceType.Market,
+                                time_in_force=TimeInForce.ROD,
+                                order_type=OrderType.Stock,
+                                user_def="hvl_stop",
+                            )
+                        else:
+                            order = Order(
+                                buy_sell=BSAction.Buy,
+                                symbol=symbol,
+                                price=None,
+                                quantity=1000,
+                                market_type=MarketType.Common,
+                                price_type=PriceType.Market,
+                                time_in_force=TimeInForce.IOC,
+                                order_type=OrderType.Stock,
+                                user_def="hvl_stop",
+                            )
+
+                        # 下單
+                        if self.__failed_exit_order_count.get(symbol, 0) < 5:
+
+                            response, place_order_start_time, place_order_end_time = await self.__place_order(order)
+
+                            if response.is_success:
+                                self.logger.info(f"{symbol} 停損/停利下單成功")
+                                self.logger.debug(
+                                    f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
+                                    f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                    f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
+                                    f"觸發行情資料:\n {data}\nresponse:\n{response}"
+                                )
+
+                                # Execute the routine after a success order
+                                order_success_routine(symbol, response, "stop")
+
+                            elif (response.message is not None) and ("集合競價" in response.message):
+                                self.logger.info(f"集合競價! 失敗停損/停利出場委託單直回:\n{response}")
+
+                                if current_pnl_pct < 0 or stop_condition_zeta:
+                                    self.logger.info(f"集合競價停損, 斷然出場 ...")
+
+                                    order = Order(
+                                        buy_sell=BSAction.Buy,
+                                        symbol=symbol,
+                                        price=None,
+                                        quantity=int(self.__position_info[symbol]["size"]),
+                                        market_type=MarketType.Common,
+                                        price_type=PriceType.LimitUp,
+                                        time_in_force=TimeInForce.ROD,
+                                        order_type=OrderType.Stock,
+                                        user_def="hvl_stop",
+                                    )
+
+                                    response, place_order_start_time, place_order_end_time = await self.__place_order(order)
+
+                                    self.logger.debug(
+                                        f"集合競價停損出場單: " +
+                                        f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
+                                        f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                        f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
+                                        f"觸發行情資料:\n{data}\nresponse:\n{response}"
+                                    )
+
+                                    # Execute the routine after a success order
+                                    order_success_routine(symbol, response, "stop")
+                                else:
+                                    self.logger.info(f"集合競價停利, 等待 5 秒再處理 ..., 觸發行情\n{data}")
+                                    await asyncio.sleep(5)
+
+                            elif (response.message is not None) and ("價格穩定" in response.message):
+                                self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
+                                await asyncio.sleep(5)
+
+                            else:
+                                self.logger.debug(f"失敗停損出場委託單直回:\n{response}\n觸發行情:\n{data}")
+
+                                # OS error handling
+                                if ("Broken pipe" in response.message) or ("os error" in response.message):
+                                    raise OSError
+
+                                if symbol in self.__failed_exit_order_count:
+                                    self.__failed_exit_order_count[symbol] += 1
+                                else:
+                                    self.__failed_exit_order_count[symbol] = 1
+
+                                if self.__failed_exit_order_count[symbol] >= 5:
+                                    self.logger.warning(f"{symbol} 停損/利下單失敗次數達 5 次!")
+                        else:
+                            self.logger.warning(f"{symbol} 停損/利下單失敗次數過多! 手動處理!")
+                            # Remove position info for the symbol
+                            if symbol in self.__position_info:
+                                del self.__position_info[symbol]
+                                self.__flush_position_info()
+
+                            # Unsubscribe the price data
+                            self.__event_loop.run_in_executor(
+                                self.__threadpool_executor,
+                                self.remove_realtime_marketdata,
+                                symbol
+                            )
+
+                            # Add the symbol to the task done list
+                            self.__symbols_task_done.append(symbol)
+
+            except OSError as err:
+                self.logger.error(f"OS Error {err} while sending orders, restart the strategy subprocess ...")
+                self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+                self.__self_restart()
+
+            except Exception as err:
+                self.logger.error(f"__realtime_price_data_processor, error: {err}")
+                self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+                self.logger.debug(f"\treceived data: {data}")
+
+            finally:
+                if is_locked:
+                    self.__on_going_orders_lock[symbol].release()
+
+        # self.logger.debug(f"__realtime_price_data_processor - {symbol} finished ...")
+
+    def __order_filled_processor(self, code, filled_data):
+        self.__event_loop.create_task(self.__order_filled_processor_async(code, filled_data))
+
+    async def __order_filled_processor_async(self, code, filled_data):
+        self.logger.debug(f"__order_filled_processor: code {code}, filled_data\n{filled_data}")
+
+        if filled_data is not None:
+            try:
+                order_no = str(filled_data.order_no)
+                symbol = str(filled_data.stock_no)
+                account_no = str(filled_data.account)
+                filled_qty = int(filled_data.filled_qty)
+                filled_price = float(filled_data.filled_price)
+
+                target_account_no = str(self.sdk_manager.active_account.account)
+
+                if account_no == target_account_no and (symbol in self.__on_going_orders_lock):
+                    async with self.__on_going_orders_lock[symbol]:
+                        if order_no in self.__order_type_enter[symbol]:
+                            if symbol not in self.__position_info:
+                                self.__position_info[symbol] = {
+                                    "price": filled_price,
+                                    "size": filled_qty
+                                }
+                                self.__flush_position_info()
+
+                            else:
+                                original_price = self.__position_info[symbol]["price"]
+                                original_size = self.__position_info[symbol]["size"]
+
+                                new_size = original_size + filled_qty
+                                new_price = (original_price * original_size + filled_price * filled_qty) / new_size
+
+                                self.__position_info[symbol] = {
+                                    "price": new_price,
+                                    "size": new_size
+                                }
+                                self.__flush_position_info()
+
+                            self.logger.debug(f"position_info updated (enter): {self.__position_info}")
+
+                        elif order_no in self.__order_type_exit[symbol]:
+                            if symbol not in self.__position_info:
+                                self.logger.debug(f"Symbol {symbol} is not in self.__position_info")
+
+                            else:
+                                original_size = self.__position_info[symbol]["size"]
+
+                                if filled_qty >= original_size:  # Position closed
+                                    # Remove position info for the symbol
+                                    del self.__position_info[symbol]
+                                    self.__flush_position_info()
+
+                                    # Unsubscribe realtime market data
+                                    self.__event_loop.run_in_executor(
+                                        self.__threadpool_executor,
+                                        self.remove_realtime_marketdata,
+                                       symbol
+                                    )
+
+                                    # Add the symbol to the task done list
+                                    self.__symbols_task_done.append(symbol)
+
+                                else:
+                                    self.__position_info[symbol]["size"] = original_size - filled_qty
+                                    self.__flush_position_info()
+
+                                self.logger.debug(f"position_info updated (stop/closure): {self.__position_info}")
+
+                        else:
+                            self.logger.debug(f"Unregistered order {order_no}, ignore.")
+                                              # f"\tenter orders - {self.__order_type_enter}\n" +
+                                              # f"\texit orders - {self.__order_type_exit}")
+
+                            return
+
+                        # Update on_going_orders
+                        try:
+                            self.__on_going_orders[symbol].remove(order_no)
+                            self.logger.debug(
+                                f"on_going_orders updated (filled data): symbol {symbol}, " +
+                                f"order_no {order_no}"
+                            )
+                        finally:
+                            pass
+                else:
+                    self.logger.debug(f"Unregistered order, ignore. account - {account_no}")
+                                      # f"\tenter orders - {self.__order_type_enter}\n" +
+                                      # f"\texit orders - {self.__order_type_exit}")
+
+            except Exception as err:
+                self.logger.error(f"Filled data processing error - {err}. Filled data:\n{filled_data}")
+
+        else:
+            self.logger.error(f"Filled order error event: code {code}, filled_data {filled_data}")
+
+
+def main(convoy_queue: multiprocessing.Queue, logger: logging.Logger):
+    try:
+        # Send the starting check message to the multiprocessing queue
+        message = {
+            "event": "start",
+            "data": None
+        }
+        convoy_queue.put(message)
+
+        # Load login info as the environment variables
+        load_dotenv()  # Load .env
+        my_id = os.getenv("ID")
+        trade_password = os.getenv("TRADEPASS")
+        cert_filepath = os.getenv("CERTFILEPATH")
+        cert_password = os.getenv("CERTPASSS")
+        active_account = os.getenv("ACTIVEACCOUNT")
+
+        # Create SDKManger instance
+        sdk_manager = SDKManager()
+        logger.info("logging in ...")
+        sdk_manager.login(my_id, trade_password, cert_filepath, cert_password)
+        logger.info("Set account No. ...")
+        sdk_manager.set_active_account_by_account_no(active_account)
+
+        # Strategy
+        my_strategy = TradingHeroAlpha(convoy_queue)
+        logger.info("Set SDK manager ...")
+        my_strategy.set_sdk_manager(sdk_manager)
+        logger.info("Start running ...")
+        my_strategy.run()
+
+        # Ending
+        logger.info("Ending session ...")
+        sdk_manager.terminate()
+
+        # Send the terminating message to the multiprocessing queue
+        message = {
+            "event": "terminate",
+            "data": None
+        }
+        convoy_queue.put(message)
+
+    except Exception as e:
+        logger.error(f"Main script exception {e}, traceback:\n{traceback.format_exc()}")
+
+    finally:
+        logger.info("program ended")
+
+
+# Main script
+if __name__ == '__main__':
+    utils.mk_folder("log")
+    utils.mk_folder("position_info_store")
+    current_date = datetime.datetime.now(ZoneInfo("Asia/Taipei")).date().strftime("%Y-%m-%d")
+
+    logger, log_shutdown_event = utils.get_logger(
+        name="Strategy_supervisor",
+        log_file=f"log/strategy_supervisor_{current_date}.log",
+        log_level=logging.DEBUG
+    )
+
+    # Start the multiprocessing procedure
+    queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=main, args=(queue, logger))
+    p.start()
+
+    while True:
+        try:
+            # Try to get a message from the queue with a timeout
+            # loop_start_time = time.time()
+            message = queue.get(timeout=30)
+
+            if message["event"] == "strategy_heartbeat":
+                pass
+                # logger.debug(f"Heartbeat interval: {message['data'] - loop_start_time:.6f} s")
+
+            elif message["event"] == "restart":
+                logger.info("Restarting strategy ...")
+                raise Empty
+
+            elif message["event"] == "position_info":
+                pos_info_file_path = \
+                    f"position_info_store/position_info_{datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d')}.json"
+
+                # Save the position info
+                try:
+                    # Load the dictionary from a JSON file
+                    with open(pos_info_file_path, 'w') as f:
+                        json.dump(message["data"], f)
+
+                    logger.debug(f"position_info updated: {message['data']}")
+
+                except Exception as e:
+                    logger.debug(f"Flush position_info to file failed!!! Exception: {e}, " +
+                                 f"traceback:\n{traceback.format_exc()}")
+
+            elif message["event"] == "terminate":
+                logger.info("Supervisor exiting ...")
+                break
+
+            elif message["event"] == "warning":
+                logger.warning(f"Over {message['data']} seconds, there is no price comes in!")
+
+            else:
+                logger.debug(f"Queue message: {message}")
+
+        except Empty:
+            # If the queue is empty, terminate the process
+            logger.debug("Operation timed out. Terminating the strategy process and starting a new one.")
+            p.terminate()
+            p.join(timeout=10)
+            p.kill()
+
+            # Start a new process
+            p = multiprocessing.Process(target=main, args=(queue, logger))
+            p.start()
+
+    # Exiting
+    log_shutdown_event.set()
+    sys.exit()
+

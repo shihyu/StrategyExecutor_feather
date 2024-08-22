@@ -1,10 +1,53 @@
 import os
 import logging
 import datetime
+import asyncio
+from multiprocessing import Process, Queue, Event
+from logging.handlers import QueueHandler, QueueListener
 
 
 # Create logger
 def get_logger(name=None, log_file='program.log', log_level=logging.INFO):
+    shutdown_event = Event()  # Create a shutdown event
+
+    # Create a logger
+    log_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if name is None else name
+    new_logger = logging.getLogger(log_name)
+    new_logger.setLevel(log_level)
+
+    # Create a formatter
+    formatter = logging.Formatter('[%(asctime)s:%(levelname)s] %(name)s: %(message)s')
+
+    # Setup multiprocessing queue and log handlers
+    log_queue_one = Queue()
+    log_queue_two = Queue()
+
+    queue_handler_channel_one = QueueHandler(log_queue_one)
+    queue_handler_channel_one.setFormatter(formatter)
+    new_logger.addHandler(queue_handler_channel_one)
+
+    queue_handler_channel_two = QueueHandler(log_queue_two)
+    queue_handler_channel_two.setFormatter(formatter)
+    new_logger.addHandler(queue_handler_channel_two)
+
+    # Start another process for logging
+    Process(
+        target=log_queue_listener_starter,
+        args=(log_queue_one,
+              log_queue_two,
+              name,
+              log_file,
+              log_level,
+              shutdown_event)
+    ).start()
+
+    return new_logger, shutdown_event
+
+def log_queue_listener_starter(log_queue_one, log_queue_two, name, log_file, log_level, shutdown_event):
+    async def log_process_keep_running():
+        while not shutdown_event.is_set():
+            await asyncio.sleep(30)
+
     # Create a logger
     log_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if name is None else name
     new_logger = logging.getLogger(log_name)
@@ -12,25 +55,29 @@ def get_logger(name=None, log_file='program.log', log_level=logging.INFO):
 
     # Create a file handler
     file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(log_level)  # or any level you want
+    file_handler.setLevel(log_level)
 
     # Create a stream handler
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(log_level)
 
     # Create a formatter
-    formatter = logging.Formatter('[%(asctime)s:%(levelname)s] %(name)s: %(message)s')
+    formatter = logging.Formatter('%(message)s')
 
     # Set the formatter for both handlers
     file_handler.setFormatter(formatter)
+    queue_listener_file = QueueListener(log_queue_one, file_handler)
+
     stream_handler.setFormatter(formatter)
+    queue_listener_stream = QueueListener(log_queue_two, stream_handler)
 
-    # Add the handlers to the logger
-    new_logger.addHandler(file_handler)
-    new_logger.addHandler(stream_handler)
+    queue_listener_file.start()
+    queue_listener_stream.start()
 
-    return new_logger
-
+    # Keep running
+    asyncio.run(log_process_keep_running())
+    queue_listener_file.stop()
+    queue_listener_stream.stop()
 
 # Timestamp to datetime
 def timestamp_to_datetime(timestamp, tz=None):
