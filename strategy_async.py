@@ -1231,8 +1231,8 @@ def main(convoy_queue: multiprocessing.Queue, logger: logging.Logger):
         }
         convoy_queue.put(message)
 
-    except Exception as e:
-        logger.error(f"Main script exception {e}, traceback:\n{traceback.format_exc()}")
+    except Exception as err:
+        logger.error(f"Main script exception {err}, traceback:\n{traceback.format_exc()}")
 
     finally:
         logger.info("program ended")

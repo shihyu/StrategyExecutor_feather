@@ -165,7 +165,7 @@ class SDKManager:
     def login(self, id, trade_password, cert_filepath, cert_password, connection_ip=None):
         """
         Establish connection to the AP server and login
-        :param connection_ip: (optional) Specify the url if want to connect to some specific place
+        :param connection_ip: (optional) Specify the url if you want to connect to some specific place
         :return: True or False, depends on if the login attempt is successful
         """
         # Reset credential info and previous connection
