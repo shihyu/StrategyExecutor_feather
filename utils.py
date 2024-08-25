@@ -24,7 +24,7 @@ def get_logger(name=None, log_file='program.log', log_level=logging.INFO):
 
     queue_handler_channel_one = QueueHandler(log_queue_one)
     queue_handler_channel_one.setFormatter(formatter)
-    new_logger.addHandler(queue_handler_channel_one)
+    #new_logger.addHandler(queue_handler_channel_one)
 
     queue_handler_channel_two = QueueHandler(log_queue_two)
     queue_handler_channel_two.setFormatter(formatter)
@@ -54,8 +54,8 @@ def log_queue_listener_starter(log_queue_one, log_queue_two, name, log_file, log
     new_logger.setLevel(log_level)
 
     # Create a file handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(log_level)
+    #file_handler = logging.FileHandler(log_file)
+    #file_handler.setLevel(log_level)
 
     # Create a stream handler
     stream_handler = logging.StreamHandler()
@@ -65,18 +65,18 @@ def log_queue_listener_starter(log_queue_one, log_queue_two, name, log_file, log
     formatter = logging.Formatter('%(message)s')
 
     # Set the formatter for both handlers
-    file_handler.setFormatter(formatter)
-    queue_listener_file = QueueListener(log_queue_one, file_handler)
+    #file_handler.setFormatter(formatter)
+    #queue_listener_file = QueueListener(log_queue_one, file_handler)
 
     stream_handler.setFormatter(formatter)
     queue_listener_stream = QueueListener(log_queue_two, stream_handler)
 
-    queue_listener_file.start()
+    #queue_listener_file.start()
     queue_listener_stream.start()
 
     # Keep running
     asyncio.run(log_process_keep_running())
-    queue_listener_file.stop()
+    #queue_listener_file.stop()
     queue_listener_stream.stop()
 
 # Timestamp to datetime

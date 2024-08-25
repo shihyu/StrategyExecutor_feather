@@ -31,7 +31,7 @@ def check_sdk(func):
 
 
 class SDKManager:
-    __version__ = "2024.10.2"
+    __version__ = "2024.10.3"
 
     def __init__(self, max_marketdata_ws_connect=1, logger=None, log_level=logging.DEBUG):
         # Set logger
@@ -425,8 +425,12 @@ class SDKManager:
             self.__subscription_details = {}
 
             for symbol in previous_subscription_list:
-                self.subscribe_realtime_trades(symbol)
-                time.sleep(0.1)
+                self.__threadpool_executor.submit(
+                    self.subscribe_realtime_trades,
+                    symbol
+                )
+                # self.subscribe_realtime_trades(symbol)
+                # time.sleep(0.01)
 
     def __connection_operator(self):
         self.sdk.init_realtime()
