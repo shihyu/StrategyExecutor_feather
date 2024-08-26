@@ -2,6 +2,8 @@ import os
 import logging
 import datetime
 import asyncio
+import threading
+import time
 from multiprocessing import Process, Queue, Event
 from logging.handlers import QueueHandler, QueueListener
 
@@ -24,7 +26,7 @@ def get_logger(name=None, log_file='program.log', log_level=logging.INFO):
 
     queue_handler_channel_one = QueueHandler(log_queue_one)
     queue_handler_channel_one.setFormatter(formatter)
-    #new_logger.addHandler(queue_handler_channel_one)
+    #new_logger.addHandler(queue_handler_channel_one) # Mute file handler, and keep log file with nohup &
 
     queue_handler_channel_two = QueueHandler(log_queue_two)
     queue_handler_channel_two.setFormatter(formatter)
@@ -44,9 +46,10 @@ def get_logger(name=None, log_file='program.log', log_level=logging.INFO):
     return new_logger, shutdown_event
 
 def log_queue_listener_starter(log_queue_one, log_queue_two, name, log_file, log_level, shutdown_event):
-    async def log_process_keep_running():
+    def log_process_keep_running():
         while not shutdown_event.is_set():
-            await asyncio.sleep(30)
+            #await asyncio.sleep(30)
+            time.sleep(10)
 
     # Create a logger
     log_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if name is None else name
@@ -75,7 +78,10 @@ def log_queue_listener_starter(log_queue_one, log_queue_two, name, log_file, log
     queue_listener_stream.start()
 
     # Keep running
-    asyncio.run(log_process_keep_running())
+    #asyncio.run(log_process_keep_running())
+    t = threading.Thread(target=log_process_keep_running)
+    t.start()
+    t.join()
     #queue_listener_file.stop()
     queue_listener_stream.stop()
 

@@ -5,10 +5,12 @@ import sys
 import time
 import logging
 import json
+import numpy
 import utils
 import datetime
 import random
 import traceback
+import functools
 from queue import Empty, Full
 from abc import ABC, abstractmethod
 from zoneinfo import ZoneInfo
@@ -80,7 +82,7 @@ class Strategy(ABC):
 
 
 class TradingHeroAlpha(Strategy):
-    __version__ = "2024.11.3"
+    __version__ = "2024.12.1"
 
     def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
         super().__init__(logger=logger, log_level=log_level)
@@ -89,9 +91,14 @@ class TradingHeroAlpha(Strategy):
         self.queue: multiprocessing.Queue = the_queue
 
         # Setup target symbols
-        self.__symbols = ['6598', '2468', '3038', '6742', '5481', '3540', '6790', '3550',
-                          '00726B', '6405', '1762', '1776', '8466', '4711', '00638R',
-                          '6024', '6237', '8088', '00756B', '00717', '01002T']
+        self.__symbols = ['00887', '3537', '5386', '1474', '5481', '4555',
+                          '4303', '4105', '8937', '4956', '6416', '4540',
+                          '1305', '3550', '1539', '2069', '1201', '2030',
+                          '8021', '6150', '1789', '3540', '6220', '3346',
+                          '2228', '6270', '6405', '1338', '6244', '5398',
+                          '00890B', '2340', '6248', '5457', '5272', '2908',
+                          '6237', '4741', '4931', '3188', '00730', '4711',
+                          '3441', '1464', '4111', '8182']
 
         self.__symbols_task_done = []
 
@@ -102,6 +109,9 @@ class TradingHeroAlpha(Strategy):
 
         self.__trail_stop_profit_cutoff: dict[str, float] | None = None
         self.__max_price_seen: dict[str, float] | None = None
+        self.__past_prices_seen: dict[str, list[float]] | None = None
+        self.__average_price: dict[str, float] | None = None
+
 
         # Order coordinators
         self.__position_info = {}
@@ -121,6 +131,7 @@ class TradingHeroAlpha(Strategy):
         self.__closure_order_placed = {}
 
         self.__on_going_orders = {}  # {symbol -> [order_no]}
+        self.__on_going_orders_details: dict[str, dict[str, float]] = {}
         self.__order_type_enter = {}
         self.__order_type_exit = {}
         self.__on_going_orders_lock: dict[str, asyncio.Lock] | None = None
@@ -132,8 +143,8 @@ class TradingHeroAlpha(Strategy):
 
         self.__suspend_entering_symbols = []
 
-        self.__price_data_queue_symbol: dict[str, asyncio.Queue] | None = None
-        self.__price_data_processor_tasks = []
+        # self.__price_data_queue_symbol: dict[str, asyncio.Queue] | None = None
+        # self.__price_data_processor_tasks = []
 
         for s in self.__symbols:
             self.__on_going_orders[s] = []
@@ -142,7 +153,7 @@ class TradingHeroAlpha(Strategy):
             # self.__on_going_orders_lock[s] = asyncio.Lock()
 
         # Position sizing
-        self.__fund_available = 600000
+        self.__fund_available = 720000
         self.__enter_lot_limit = 3
         self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
@@ -155,7 +166,7 @@ class TradingHeroAlpha(Strategy):
         second_digit_offset = [*range(-25, 26, 1)]
         self.__strategy_exit_time = datetime.time(13, int(16 + random.choice(minute_digit_offset)),
                                                   int(30 + random.choice(second_digit_offset)))
-        self.__strategy_enter_cutoff_time = datetime.time(9, 15)
+        self.__strategy_enter_cutoff_time = datetime.time(9, 45)
         self.__market_close_time = datetime.time(13, 32)
         self.__is_market_close_time_passed = False  # Flag for using self.__price_data_queue_handler()
 
@@ -204,7 +215,10 @@ class TradingHeroAlpha(Strategy):
                     self.logger.warning("Supervisor's queue is full ...")
 
             # Terminate early if all tasks done
-            if self.__symbols_task_done and set(self.__symbols_task_done).issubset(set(self.__symbols)):
+            if self.__symbols_task_done and \
+                    set(self.__symbols_task_done) == set(self.__symbols):
+                    # set(self.__symbols_task_done).issubset(set(self.__symbols)) and \
+                    # set(self.__symbols).issubset(set(self.__symbols_task_done)):
                 self.__market_close_time = now_time
                 self.logger.info(f"All tasks done, exit early ...")
 
@@ -229,10 +243,24 @@ class TradingHeroAlpha(Strategy):
     async def __place_order(self, order):
         place_order_start_time = time.time()
 
-        response = self.sdk_manager.sdk.stock.place_order(
+        # response = self.sdk_manager.sdk.stock.place_order(
+        #     self.sdk_manager.active_account,
+        #     order,
+        #     unblock=False,
+        # )
+
+        # Create a partial function with unblock set to False
+        place_order_partial = functools.partial(
+            self.sdk_manager.sdk.stock.place_order,
             self.sdk_manager.active_account,
             order,
-            unblock=False,
+            unblock=False
+        )
+
+        # Run in executor
+        response = await self.__event_loop.run_in_executor(
+            self.__threadpool_executor,
+            place_order_partial
         )
 
         place_order_end_time = time.time()
@@ -261,8 +289,11 @@ class TradingHeroAlpha(Strategy):
         self.logger_shutdown.set()
 
     async def __async_run(self):
-        # Record the event loop
+        # Initialize the event loop
         self.__event_loop = asyncio.get_event_loop()
+        self.__event_loop.set_task_factory(asyncio.eager_task_factory)
+
+        # Start the heartbeat
         heartbeat_task = self.__event_loop.create_task(self.__heartbeat_task())
 
         # Get stock's last day close price
@@ -334,12 +365,14 @@ class TradingHeroAlpha(Strategy):
 
         self.logger.info("Strategy.run - Initialize price data queue and processing tasks per symbol ...")
 
-        self.__price_data_queue_symbol = {symbol: asyncio.Queue() for symbol in self.__symbols}
-        self.__price_data_processor_tasks = [self.__event_loop.create_task(self.__realtime_price_data_processor(symbol))
-                                             for symbol in self.__symbols]
+        # self.__price_data_queue_symbol = {symbol: asyncio.Queue() for symbol in self.__symbols}
+        # self.__price_data_processor_tasks = [self.__event_loop.create_task(self.__realtime_price_data_processor(symbol))
+        #                                      for symbol in self.__symbols]
         self.__on_going_orders_lock = {symbol: asyncio.Lock() for symbol in self.__symbols}
         self.__trail_stop_profit_cutoff = {symbol: -999 for symbol in self.__symbols}
         self.__max_price_seen = {symbol: 0 for symbol in self.__symbols}
+        self.__past_prices_seen = {symbol: [] for symbol in self.__symbols}
+        self.__average_price = {symbol: 0 for symbol in self.__symbols}
 
         # Await
         await asyncio.sleep(0)
@@ -372,7 +405,7 @@ class TradingHeroAlpha(Strategy):
         await t
         await heartbeat_task
         await queue_handler
-        await asyncio.gather(*self.__price_data_processor_tasks)
+        # await asyncio.gather(*self.__price_data_processor_tasks)
 
         self.logger.debug(f"async run finished ...")
 
@@ -435,7 +468,7 @@ class TradingHeroAlpha(Strategy):
                                 symbol = str(d.stock_no)
                                 status = int(d.status)
 
-                                if status != 10:
+                                if (status != 10) and (status != 50):
                                     if not self.__on_going_orders_lock[symbol].locked():
                                         async with self.__on_going_orders_lock[symbol]:
                                             try:
@@ -444,6 +477,7 @@ class TradingHeroAlpha(Strategy):
                                                     f"on_going_orders updated (order updater): symbol {symbol}, " +
                                                     f"order_no {order_no}"
                                                 )
+
                                             finally:
                                                 continue
 
@@ -518,9 +552,15 @@ class TradingHeroAlpha(Strategy):
                             else:
                                 self.__on_going_orders[symbol] = [response.data.order_no]
 
+                            order_no = response.data.order_no
+                            if order_no not in self.__on_going_orders_details:
+                                self.__on_going_orders_details[order_no] = {"ordered":0, "filled":0}
+                            self.__on_going_orders_details[order_no]["ordered"] += float(response.data.after_qty)
+
                             self.logger.debug(
                                 f"on_going_orders updated (closure): symbol {symbol}, " +
-                                f"order_no {response.data.order_no}"
+                                f"order_no {response.data.order_no}, " +
+                                f"order details: {self.__on_going_orders_details[order_no]}"
                             )
 
                             # Update qty
@@ -610,11 +650,17 @@ class TradingHeroAlpha(Strategy):
         self.__symbols_task_done = self.__symbols
 
     async def __price_data_queue_handler(self):
+        def add_item(my_list, new_item):
+            my_list.append(new_item)
+            if len(my_list) > 5:
+                my_list.pop(0)
+
         self.logger.debug(f"__price_data_queue_handler start running ...")
 
         while not self.__is_market_close_time_passed:
             try:
-                data = await asyncio.wait_for(self.__ws_message_queue.get(), timeout=5)
+                async with asyncio.timeout(5):
+                    data = await self.__ws_message_queue.get()
 
                 # Update the newest timestamp over all symbols
                 timestamp = int(data["time"])
@@ -633,6 +679,15 @@ class TradingHeroAlpha(Strategy):
                         baseline_price = float(data["price"]) if "price" in data else float(data["bid"])
                         if baseline_price > self.__max_price_seen[symbol]:
                             self.__max_price_seen[symbol] = baseline_price
+
+                        # Update past prices seen
+                        add_item(self.__past_prices_seen[symbol], baseline_price)
+
+                        # Update the average price
+                        if len(self.__past_prices_seen[symbol]) >= 5:
+                            self.__average_price[symbol] = \
+                                numpy.mean(self.__past_prices_seen[symbol])
+
                     except (KeyError, ValueError) as err:
                         pass
 
@@ -652,13 +707,15 @@ class TradingHeroAlpha(Strategy):
 
                 # Pass the message for further processing (or not)
                 if pass_data_flag:
-                    try:
-                        self.__price_data_queue_symbol[symbol].put_nowait(data)
-                    except asyncio.QueueFull as err:
-                        self.logger.warning(f"Queue for {symbol} is full! err {err}")
-                    # asyncio.ensure_future(self.__realtime_price_data_processor(data), loop=self.__event_loop)
+                    # try:
+                    #     self.__price_data_queue_symbol[symbol].put_nowait(data)
+                    # except asyncio.QueueFull as err:
+                    #     self.logger.warning(f"Queue for {symbol} is full! err {err}")
+                    asyncio.ensure_future(
+                        self.__event_loop.create_task(self.__realtime_price_data_processor(data))
+                    )
 
-            except asyncio.TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 pass
 
             except Exception as err:
@@ -669,8 +726,8 @@ class TradingHeroAlpha(Strategy):
 
         self.logger.debug(f"__price_data_queue_handler finished ...")
 
-    # async def __realtime_price_data_processor(self, data):
-    async def __realtime_price_data_processor(self, symbol: str):
+    async def __realtime_price_data_processor(self, data):
+    # async def __realtime_price_data_processor(self, symbol: str):
         def order_success_routine(symbol, response, order_type):
             try:
                 if order_type == "enter":
@@ -692,9 +749,15 @@ class TradingHeroAlpha(Strategy):
                 else:
                     self.__on_going_orders[symbol] = [response.data.order_no]
 
+                order_no = response.data.order_no
+                if order_no not in self.__on_going_orders_details:
+                    self.__on_going_orders_details[order_no] = {"ordered":0, "filled":0}
+                self.__on_going_orders_details[order_no]["ordered"] += float(response.data.after_qty)
+
                 self.logger.debug(
                     f"on_going_orders updated ({order_type}): symbol {symbol}, " +
-                    f"order_no {response.data.order_no}"
+                    f"order_no {response.data.order_no}, " +
+                    f"order_details: {self.__on_going_orders_details[order_no]}"
                 )
             except Exception as er:
                 self.logger.error(f"exit_order_success_routine failed! Exception: {er}, " +
@@ -703,39 +766,39 @@ class TradingHeroAlpha(Strategy):
         # ########################
         #        Main body
         # ########################
-        while symbol not in self.__symbols_task_done:
-            # Retrieve data
-            try:
-                data: dict | None = None
-                data = await asyncio.wait_for(
-                    self.__price_data_queue_symbol[symbol].get(), timeout=5
-                )
-
-                if data.get("symbol", "not likely") != symbol:
-                    raise Exception
-
-            except asyncio.TimeoutError:
-                continue
-
-            except KeyError as err:
-                self.logger.error(f"Symbol {symbol} is not in the queue, err {err}! Will not process this symbol.")
-                self.logger.debug(f"price data queue per symbol keys: {self.__price_data_queue_symbol.keys()}")
-                self.logger.debug(f"Traceback\n{traceback.format_exc()}")
-                break
-
-            except Exception as err:
-                self.logger.error(f"Symbol {symbol} retrieve data exception: {err}, " +
-                                  f"traceback\n{traceback.format_exc()}")
-                continue
-
+        # while symbol not in self.__symbols_task_done:
+        #     # Retrieve data
+        #     try:
+        #         data: dict | None = None
+        #         data = await asyncio.wait_for(
+        #             self.__price_data_queue_symbol[symbol].get(), timeout=5
+        #         )
+        #
+        #         if data.get("symbol", "not likely") != symbol:
+        #             raise Exception
+        #
+        #     except asyncio.TimeoutError:
+        #         continue
+        #
+        #     except KeyError as err:
+        #         self.logger.error(f"Symbol {symbol} is not in the queue, err {err}! Will not process this symbol.")
+        #         self.logger.debug(f"price data queue per symbol keys: {self.__price_data_queue_symbol.keys()}")
+        #         self.logger.debug(f"Traceback\n{traceback.format_exc()}")
+        #         break
+        #
+        #     except Exception as err:
+        #         self.logger.error(f"Symbol {symbol} retrieve data exception: {err}, " +
+        #                           f"traceback\n{traceback.format_exc()}")
+        #         continue
+        if True:
             # Trading logic
             initialization_time = time.time()
-            # symbol = None
+            symbol = None
             is_locked = False
 
             try:
                 # Proceed to the trading logic
-                # symbol = data["symbol"]
+                symbol = data["symbol"]
                 is_continuous = True if "isContinuous" in data else False
                 is_open = True if "isOpen" in data else False
 
@@ -752,10 +815,10 @@ class TradingHeroAlpha(Strategy):
                     gap_change_pct = 100 * (self.__open_price_today[symbol] - self.__lastday_close[symbol]) \
                                      / self.__lastday_close[symbol]
 
-                    if (gap_change_pct < 1) or (gap_change_pct > 6):  # Do not trade this target today
+                    if (gap_change_pct < 1) or (gap_change_pct > 7):  # Do not trade this target today
                         self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的")
                         self.__open_order_placed[symbol] = 99999
-                        await self.__event_loop.run_in_executor(
+                        self.__event_loop.run_in_executor(
                             self.__threadpool_executor,
                             self.remove_realtime_marketdata,
                             symbol
@@ -763,9 +826,6 @@ class TradingHeroAlpha(Strategy):
                         self.__symbols_task_done.append(symbol)
 
                         return
-
-                # Await
-                await asyncio.sleep(0)
 
                 # Start trading logic =============
                 order_lock_checkpoint_start = time.time()
@@ -811,8 +871,9 @@ class TradingHeroAlpha(Strategy):
                         pre_allocate_fund = 0
                         fund_lock_checkpoint_start = fund_lock_checkpoint_end = 0  # init the timer variables
 
-                        if (1 < price_change_pct_bid < 5) and \
-                                (baseline_price < self.__max_price_seen[symbol]):
+                        if (1 < price_change_pct_bid < 7) and \
+                                (baseline_price < self.__max_price_seen[symbol]) and \
+                                (baseline_price < self.__average_price[symbol]):
                             fund_lock_checkpoint_start = time.time()
                             async with self.__fund_available_update_lock:
                                 fund_lock_checkpoint_end = time.time()
@@ -928,7 +989,7 @@ class TradingHeroAlpha(Strategy):
                                     else:
                                         self.logger.info(f"{symbol} 進場下單失敗次數達 2 次且未進場，移除標的")
                                         self.__open_order_placed[symbol] = 99999
-                                        await self.__event_loop.run_in_executor(
+                                        self.__event_loop.run_in_executor(
                                             self.__threadpool_executor,
                                             self.remove_realtime_marketdata,
                                             symbol
@@ -946,15 +1007,12 @@ class TradingHeroAlpha(Strategy):
 
                 elif (symbol not in self.__open_order_placed) and (not self.__is_reload):  # 今天完全沒進場
                     self.logger.info(f"{symbol} 今日無進場，移除股價行情訂閱 ...")
-                    await self.__event_loop.run_in_executor(
+                    self.__event_loop.run_in_executor(
                         self.__threadpool_executor,
                         self.remove_realtime_marketdata,
                         symbol
                     )
                     self.__symbols_task_done.append(symbol)
-
-                # Await
-                await asyncio.sleep(0)
 
                 # 停損停利出場
                 if (now_time < self.__strategy_exit_time) and \
@@ -971,9 +1029,9 @@ class TradingHeroAlpha(Strategy):
                     gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
                         symbol]
 
-                    if (self.__trail_stop_profit_cutoff[symbol] < 0) and (current_pnl_pct >= 6):
+                    if (self.__trail_stop_profit_cutoff[symbol] < 0) and (current_pnl_pct >= 3.5):
                         # Set the cutoff to the current_pnl_pct
-                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct
+                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
                     elif (self.__trail_stop_profit_cutoff[symbol] > 0) and \
                             (current_pnl_pct - self.__trail_stop_profit_cutoff[symbol] >= 1):
                         # Rise the cutoff
@@ -1095,7 +1153,7 @@ class TradingHeroAlpha(Strategy):
                                 self.__flush_position_info()
 
                             # Unsubscribe the price data
-                            await self.__event_loop.run_in_executor(
+                            self.__event_loop.run_in_executor(
                                 self.__threadpool_executor,
                                 self.remove_realtime_marketdata,
                                 symbol
@@ -1118,15 +1176,16 @@ class TradingHeroAlpha(Strategy):
                 if is_locked:
                     self.__on_going_orders_lock[symbol].release()
 
-                # Await
-                await asyncio.sleep(0)
+                # # Await
+                # await asyncio.sleep(0)
 
         # self.logger.debug(f"__realtime_price_data_processor - {symbol} finished ...")
 
     def __order_filled_processor(self, code, filled_data):
         asyncio.ensure_future(
-            self.__order_filled_processor_async(code, filled_data),
-            loop=self.__event_loop
+            self.__event_loop.create_task(
+                self.__order_filled_processor_async(code, filled_data)
+            )
         )
 
     async def __order_filled_processor_async(self, code, filled_data):
@@ -1183,7 +1242,7 @@ class TradingHeroAlpha(Strategy):
                                     self.__symbols_task_done.append(symbol)
 
                                     # Unsubscribe realtime market data
-                                    await self.__event_loop.run_in_executor(
+                                    self.__event_loop.run_in_executor(
                                         self.__threadpool_executor,
                                         self.remove_realtime_marketdata,
                                         symbol
@@ -1202,13 +1261,23 @@ class TradingHeroAlpha(Strategy):
 
                         # Update on_going_orders
                         try:
-                            self.__on_going_orders[symbol].remove(order_no)
+                            self.__on_going_orders_details[order_no]["filled"] += filled_qty
+                            if self.__on_going_orders_details[order_no]["filled"] >= \
+                                    self.__on_going_orders_details[order_no]["ordered"]:
+                                self.__on_going_orders[symbol].remove(order_no)
+
                             self.logger.debug(
                                 f"on_going_orders updated (filled data): symbol {symbol}, " +
-                                f"order_no {order_no}"
+                                f"order_no {order_no}, " +
+                                f"order details: {self.__on_going_orders_details[order_no]}"
                             )
-                        finally:
-                            pass
+                        except Exception as err:
+                            self.logger.error(f"Update on_going_orders (filled data) exception: {err}, " +
+                                              f"traceback {traceback.format_exc()}")
+                            if order_no in self.__on_going_orders[symbol]:
+                                self.__on_going_orders[symbol].remove(order_no)
+                                self.logger.info(f"Remove order anyway (filled data): symbol {symbol}, " +
+                                                 f"order_no {order_no}")
                 else:
                     self.logger.debug(f"Unregistered order, ignore. account - {account_no}")
 
