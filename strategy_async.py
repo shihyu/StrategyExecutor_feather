@@ -82,7 +82,7 @@ class Strategy(ABC):
 
 
 class TradingHeroAlpha(Strategy):
-    __version__ = "2024.12.1"
+    __version__ = "2024.12.2"
 
     def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
         super().__init__(logger=logger, log_level=log_level)
@@ -153,7 +153,7 @@ class TradingHeroAlpha(Strategy):
             # self.__on_going_orders_lock[s] = asyncio.Lock()
 
         # Position sizing
-        self.__fund_available = 720000
+        self.__fund_available = int(720000/2)
         self.__enter_lot_limit = 3
         self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
@@ -711,9 +711,10 @@ class TradingHeroAlpha(Strategy):
                     #     self.__price_data_queue_symbol[symbol].put_nowait(data)
                     # except asyncio.QueueFull as err:
                     #     self.logger.warning(f"Queue for {symbol} is full! err {err}")
-                    asyncio.ensure_future(
-                        self.__event_loop.create_task(self.__realtime_price_data_processor(data))
-                    )
+
+                    #asyncio.ensure_future(
+                    self.__event_loop.create_task(self.__realtime_price_data_processor(data))
+                    #)
 
             except (TimeoutError, asyncio.TimeoutError):
                 pass
@@ -882,9 +883,10 @@ class TradingHeroAlpha(Strategy):
 
                                 # Calculate quantity to bid
                                 if max_share_possible < 1000:
-                                    self.logger.info(f"剩餘可用額度不足, symbol {symbol}, price {data['bid']}, " +
-                                                     f"fund_available {self.__fund_available}")
-                                    self.logger.info(f"{symbol} 稍後再確認進場訊號 ...")
+                                    # self.logger.info(f"剩餘可用額度不足, symbol {symbol}, price {data['bid']}, " +
+                                    #                  f"fund_available {self.__fund_available}")
+                                    # self.logger.info(f"{symbol} 稍後再確認進場訊號 ...")
+                                    pass
 
                                 else:
                                     quantity_to_bid = int(self.__enter_lot_limit * 1000)
@@ -1182,11 +1184,11 @@ class TradingHeroAlpha(Strategy):
         # self.logger.debug(f"__realtime_price_data_processor - {symbol} finished ...")
 
     def __order_filled_processor(self, code, filled_data):
-        asyncio.ensure_future(
-            self.__event_loop.create_task(
-                self.__order_filled_processor_async(code, filled_data)
-            )
+        #asyncio.ensure_future(
+        self.__event_loop.create_task(
+            self.__order_filled_processor_async(code, filled_data)
         )
+        #)
 
     async def __order_filled_processor_async(self, code, filled_data):
         self.logger.debug(f"__order_filled_processor: code {code}, filled_data\n{filled_data}")

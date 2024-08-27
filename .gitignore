@@ -9,3 +9,5 @@
 /*.json
 /test.*
 /Archive/
+/strategy_gui.py
+/position_info_store/
