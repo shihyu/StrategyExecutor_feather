@@ -82,7 +82,7 @@ class Strategy(ABC):
 
 
 class TradingHeroAlpha(Strategy):
-    __version__ = "2024.12.2"
+    __version__ = "2024.12.6"
 
     def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
         super().__init__(logger=logger, log_level=log_level)
@@ -91,14 +91,7 @@ class TradingHeroAlpha(Strategy):
         self.queue: multiprocessing.Queue = the_queue
 
         # Setup target symbols
-        self.__symbols = ['00887', '3537', '5386', '1474', '5481', '4555',
-                          '4303', '4105', '8937', '4956', '6416', '4540',
-                          '1305', '3550', '1539', '2069', '1201', '2030',
-                          '8021', '6150', '1789', '3540', '6220', '3346',
-                          '2228', '6270', '6405', '1338', '6244', '5398',
-                          '00890B', '2340', '6248', '5457', '5272', '2908',
-                          '6237', '4741', '4931', '3188', '00730', '4711',
-                          '3441', '1464', '4111', '8182']
+        self.__symbols = ['1524', '6158', '00710B', '6591', '2431', '3489', '3540', '00726B', '1337', '8249', '6024', '3219', '3317', '6248', '2342', '00730', '3441', '3484', '8131', '00756B', '8431', '4523']
 
         self.__symbols_task_done = []
 
@@ -153,7 +146,7 @@ class TradingHeroAlpha(Strategy):
             # self.__on_going_orders_lock[s] = asyncio.Lock()
 
         # Position sizing
-        self.__fund_available = int(720000/2)
+        self.__fund_available = 400000
         self.__enter_lot_limit = 3
         self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
@@ -301,8 +294,29 @@ class TradingHeroAlpha(Strategy):
 
         self.logger.info("Strategy.run - Getting stock close price of the last trading day ...")
         for s in self.__symbols:
-            response = rest_stock.intraday.quote(symbol=s)
-            self.__lastday_close[s] = float(response["previousClose"])
+            try:
+                is_task_success = False
+                response = {}
+
+                while not is_task_success:
+                    response = rest_stock.intraday.quote(symbol=s)
+                    if "status" in response and "429" in response:
+                        self.logger.info(f"statusCode 429, wait and try again ...")
+                        await asyncio.sleep(60)
+                    elif datetime.datetime.strptime(response["date"], "%Y-%m-%d").date() != \
+                            datetime.datetime.now(ZoneInfo("Asia/Taipei")).date():
+                        self.logger.info(f"Date {response["date"]} is not today, wait and try again ...")
+                        await asyncio.sleep(60)
+                    else:
+                        is_task_success = True
+
+                self.__lastday_close[s] = float(response["previousClose"])
+                self.logger.debug(f"symbol: {s}, previous_close: {self.__lastday_close[s]}")
+
+            except Exception as er:
+                self.logger.error(f"{s} get the last day close error: {er}, traceback\n{traceback.format_exc()}")
+                self.__lastday_close[s] = 9999999999
+
             await asyncio.sleep(0.1)
 
         # Set callback functions
@@ -703,7 +717,12 @@ class TradingHeroAlpha(Strategy):
                             symbol]
                         stop_condition_zeta = (gap_until_now_pct >= 8)
 
-                    pass_data_flag = stop_condition_zeta or (not self.__on_going_orders_lock[symbol].locked())
+                    if self.__is_reload:
+                        pass_data_flag = stop_condition_zeta or (not self.__on_going_orders_lock[symbol].locked())
+                    else:
+                        pass_data_flag = stop_condition_zeta or \
+                                         ((not self.__on_going_orders_lock[symbol].locked()) and
+                                          self.__average_price[symbol] > 0)
 
                 # Pass the message for further processing (or not)
                 if pass_data_flag:
@@ -816,8 +835,10 @@ class TradingHeroAlpha(Strategy):
                     gap_change_pct = 100 * (self.__open_price_today[symbol] - self.__lastday_close[symbol]) \
                                      / self.__lastday_close[symbol]
 
-                    if (gap_change_pct < 1) or (gap_change_pct > 7):  # Do not trade this target today
-                        self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的")
+                    if (gap_change_pct <= 1) or (gap_change_pct >= 7):  # Do not trade this target today
+                        self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的" +
+                                         f"lastday_close: {self.__lastday_close[symbol]}, " +
+                                          f"open_price_today: {self.__open_price_today[symbol]}")
                         self.__open_order_placed[symbol] = 99999
                         self.__event_loop.run_in_executor(
                             self.__threadpool_executor,
@@ -827,6 +848,11 @@ class TradingHeroAlpha(Strategy):
                         self.__symbols_task_done.append(symbol)
 
                         return
+                    elif is_open:
+                        self.logger.debug(f"{symbol} 開盤漲幅符合區間 (實際漲幅: {gap_change_pct:.2f} %). " +
+                                          f"lastday_close: {self.__lastday_close[symbol]}, " +
+                                          f"open_price_today: {self.__open_price_today[symbol]}")
+
 
                 # Start trading logic =============
                 order_lock_checkpoint_start = time.time()
@@ -1184,11 +1210,10 @@ class TradingHeroAlpha(Strategy):
         # self.logger.debug(f"__realtime_price_data_processor - {symbol} finished ...")
 
     def __order_filled_processor(self, code, filled_data):
-        #asyncio.ensure_future(
-        self.__event_loop.create_task(
-            self.__order_filled_processor_async(code, filled_data)
+        asyncio.run_coroutine_threadsafe(
+            self.__order_filled_processor_async(code, filled_data),
+            loop=self.__event_loop
         )
-        #)
 
     async def __order_filled_processor_async(self, code, filled_data):
         self.logger.debug(f"__order_filled_processor: code {code}, filled_data\n{filled_data}")
@@ -1285,6 +1310,11 @@ class TradingHeroAlpha(Strategy):
 
             except Exception as err:
                 self.logger.error(f"Filled data processing error - {err}. Filled data:\n{filled_data}")
+
+                # Deal with 'NoneType' object has no attribute 'create_future'
+                if "create_future" in str(err):
+                    self.logger.info(f"Filled data processing - Re-process the filled_data")
+                    self.__order_filled_processor(code, filled_data)
 
         else:
             self.logger.error(f"Filled order error event: code {code}, filled_data {filled_data}")
