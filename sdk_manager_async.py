@@ -1,4 +1,3 @@
-# import os
 import logging
 import asyncio
 import threading
@@ -8,7 +7,6 @@ import utils
 import datetime
 import functools
 import json
-# import inspect
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 import fubon_neo
@@ -31,7 +29,7 @@ def check_sdk(func):
 
 
 class SDKManager:
-    __version__ = "2024.10.3"
+    __version__ = "2024.10.5"
 
     def __init__(self, max_marketdata_ws_connect=1, logger=None, log_level=logging.DEBUG):
         # Set logger
@@ -602,14 +600,16 @@ class SDKManager:
             #     self.on_disconnect_callback = func
             # case "error":
             #     self.on_error_callback = func
-            # case "message":
-            #     self.on_message_callback = func
+            case "message":
+                self.on_message_callback = func
+                self.__logger.debug(f"Set self.on_message_callback = {func}")
             case _:
                 self.__logger.error(f"Undefined function name {func_name}")
                 # return
 
         # Set callbacks
         for ws in self.__ws_connections:
+            ws.ee.remove_all_listeners()
             ws.on("connect", self.on_connect_callback)
             ws.on("disconnect", self.on_disconnect_callback)
             ws.on("error", self.on_error_callback)
@@ -675,32 +675,30 @@ class SDKManager:
         return None
 
     def __ws_on_message_handler(self, message):
-        # if self.on_message_callback is not None:
         if "pong" not in message:
             try:
                 time_now = time.time()
                 msg = json.loads(message)  # Loads json str to dictionary
 
                 if (msg["event"] == "data") and (self.__ws_message_queue is not None):
-                    # if self.on_message_callback is not None:
-                    #     # Pass the message to the custom callback function
-                    #     # self.__event_loop.create_task(
-                    #     #     self.__ws_on_message_handler_task(msg, time_now)
-                    #     # )
-                    #     try:
-                    #         self.__trade_message_queue.put_nowait([msg, time_now])
-                    #
-                    #     except asyncio.QueueFull as e:
-                    #         self.__logger.warning(f"self.__trade_message_queue is full! Exception: {e}")
+                    # Add meta-data
                     msg["data"]["ws_received_time"] = time_now
                     msg["data"]["ws_latency"] = time_now - int(msg["data"]["time"]) / 1000000
+
+                    # Invoke the callback
                     try:
-                        self.__ws_message_queue.put_nowait(msg["data"])
-                    except asyncio.QueueFull as e:
-                        self.__logger.warning(f"self.__trade_message_queue is full! Exception: {e}")
+                        self.on_message_callback(msg["data"])
                     except Exception as e:
                         self.__logger.error(f"self.__trade_message_queue Exception: {e}, " +
                                             f"traceback:\n{traceback.format_exc()}")
+
+                    # try:
+                    #     self.__ws_message_queue.put_nowait(msg["data"])
+                    # except asyncio.QueueFull as e:
+                    #     self.__logger.warning(f"self.__trade_message_queue is full! Exception: {e}")
+                    # except Exception as e:
+                    #     self.__logger.error(f"self.__trade_message_queue Exception: {e}, " +
+                    #                         f"traceback:\n{traceback.format_exc()}")
 
                 elif msg["event"] == "subscribed":  # subscription detail update
                     symbol = msg["data"]["symbol"]
@@ -738,63 +736,3 @@ class SDKManager:
                 self.__logger.error(f"__ws_on_message_handler error: {e}, msg = {message}, " +
                                     f"traceback:\n{traceback.format_exc()}")
 
-    # async def __ws_on_message_handler_queue_manager(self):
-    #     while not self.__is_terminate:
-    #         item = await self.__trade_message_queue.get()
-    #
-    #         try:
-    #             # Retrieve information
-    #             message = item[0]
-    #             received_time = item[1]
-    #             message["data"]["ws_received_time"] = received_time
-    #             message["data"]["ws_latency"] = received_time - int(message["data"]["time"]) / 1000000
-    #
-    #             if inspect.iscoroutinefunction(self.on_message_callback):
-    #                 # If it's an async function, await it directly
-    #                 asyncio.ensure_future(self.on_message_callback(message["data"]))
-    #             else:
-    #                 # If it's a regular function, run it in the executor
-    #                 self.__event_loop.run_in_executor(
-    #                     self.__threadpool_executor,
-    #                     self.on_message_callback,
-    #                     message["data"]
-    #                 )
-    #
-    #         except Exception as e:
-    #             self.__logger.debug(f"__ws_on_message_handler_queue_manager exception: {e}, " +
-    #                                 f"traceback:\n{traceback.format_exc()}")
-
-    # async def __ws_on_message_handler_task(self, message: dict, received_time: float):
-    #     try:
-    #         data = message["data"]
-    #         symbol = data["symbol"]
-    #         lock = self.__realtime_data_processing_locks[symbol]
-    #     except Exception as e:
-    #         self.__logger.error(f"__ws_on_message_handler_task err: {e}, traceback:\n{traceback.format_exc()}")
-    #         return
-    #
-    #     if await lock.acquire(timeout=0):
-    #         try:
-    #             timestamp = int(data["time"])
-    #
-    #             message["data"]["ws_received_time"] = received_time
-    #             message["data"]["ws_latency"] = received_time - timestamp / 1000000
-    #
-    #             if inspect.iscoroutinefunction(self.on_message_callback):
-    #                 # If it's an async function, await it directly
-    #                 await self.on_message_callback(message["data"])
-    #             else:
-    #                 # If it's a regular function, run it in the executor
-    #                 await self.__event_loop.run_in_executor(
-    #                     self.__threadpool_executor,
-    #                     self.on_message_callback,
-    #                     message["data"]
-    #                 )
-    #
-    #         except Exception as e:
-    #             self.__logger.error(f"__ws_on_message_handler_task error: error - {e}, message - {message}")
-    #
-    #         finally:
-    #             lock.release()
-    #     else:
-    #         self.__logger.debug(f"Cannot acquire lock, pass processing the data:\n{data}")

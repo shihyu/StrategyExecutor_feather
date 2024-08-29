@@ -82,7 +82,7 @@ class Strategy(ABC):
 
 
 class TradingHeroAlpha(Strategy):
-    __version__ = "2024.12.6"
+    __version__ = "2024.12.7"
 
     def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
         super().__init__(logger=logger, log_level=log_level)
@@ -264,16 +264,6 @@ class TradingHeroAlpha(Strategy):
     def run(self):
         # Startup async event loops
         asyncio.run(self.__async_run())
-        # threads = [threading.Thread(target=self.__event_loop.run_until_complete, args=(self.async_run(),)),
-        #            threading.Thread(
-        #                target=self.__price_data_queue_event_loop.run_until_complete,
-        #                args=(self.__price_data_queue_handler(),))]
-        #
-        # for t in threads:
-        #     t.start()
-        #
-        # for t in threads:
-        #     t.join()
 
         # Finishing ...
         self.__threadpool_executor.shutdown(wait=False, cancel_futures=True)
@@ -320,10 +310,12 @@ class TradingHeroAlpha(Strategy):
             await asyncio.sleep(0.1)
 
         # Set callback functions
+        self.logger.debug("Strategy.run - Set callback functions ...")
         self.sdk_manager.set_trade_handle_func("on_filled", self.__order_filled_processor)
         # self.sdk_manager.set_ws_handle_func("message", self.__realtime_price_data_processor)  # Marketdata
-        self.sdk_manager.set_ws_message_handle_queue(self.__ws_message_queue)
-        queue_handler = self.__event_loop.create_task(self.__price_data_queue_handler())
+        self.sdk_manager.set_ws_handle_func("message", self.__price_data_callback)
+        # self.sdk_manager.set_ws_message_handle_queue(self.__ws_message_queue)
+        #queue_handler = self.__event_loop.create_task(self.__price_data_queue_handler())
 
         # Remove symbols that can do day-trade short sell
         self.logger.debug("Strategy.run - Cleaning symbol list ...")
@@ -418,8 +410,7 @@ class TradingHeroAlpha(Strategy):
         await tps
         await t
         await heartbeat_task
-        await queue_handler
-        # await asyncio.gather(*self.__price_data_processor_tasks)
+        # await queue_handler
 
         self.logger.debug(f"async run finished ...")
 
@@ -663,6 +654,72 @@ class TradingHeroAlpha(Strategy):
         self.logger.debug(f"Position closure executor completed.")
         self.__symbols_task_done = self.__symbols
 
+    def __price_data_callback(self, data):
+        def add_item(my_list, new_item):
+            my_list.append(new_item)
+            if len(my_list) > 5:
+                my_list.pop(0)
+
+        try:
+            # Update the newest timestamp over all symbols
+            timestamp = int(data["time"])
+            if timestamp > self.__max_latest_price_timestamp:
+                self.__max_latest_price_timestamp = timestamp
+
+            # Determine if pass to further processing
+            is_continuous = True if "isContinuous" in data else False
+            is_open = True if "isOpen" in data else False
+
+            pass_data_flag = False
+            symbol = data["symbol"]
+
+            if is_open or is_continuous:
+                try:
+                    baseline_price = float(data["price"]) if "price" in data else float(data["bid"])
+                    if baseline_price > self.__max_price_seen[symbol]:
+                        self.__max_price_seen[symbol] = baseline_price
+
+                    # Update past prices seen
+                    add_item(self.__past_prices_seen[symbol], baseline_price)
+
+                    # Update the average price
+                    if len(self.__past_prices_seen[symbol]) >= 5:
+                        self.__average_price[symbol] = \
+                            numpy.mean(self.__past_prices_seen[symbol])
+
+                except (KeyError, ValueError) as err:
+                    self.logger.debug(f"__price_data_callback exception: {err}, traceback:\n{traceback.format_exc()}")
+                    return
+
+            if is_open:
+                pass_data_flag = True
+            elif is_continuous:
+                stop_condition_zeta = False
+                if symbol in self.__position_info:
+                    # Calculate pre-screen variables
+                    ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
+                        data["price"])  # Add if for robustness
+                    gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
+                        symbol]
+                    stop_condition_zeta = (gap_until_now_pct >= 8)
+
+                if self.__is_reload:
+                    pass_data_flag = stop_condition_zeta or (not self.__on_going_orders_lock[symbol].locked())
+                else:
+                    pass_data_flag = stop_condition_zeta or \
+                                     ((not self.__on_going_orders_lock[symbol].locked()) and
+                                      self.__average_price[symbol] > 0)
+
+            # Pass the message for further processing (or not)
+            if pass_data_flag:
+                asyncio.run_coroutine_threadsafe(
+                    self.__realtime_price_data_processor(data),
+                    loop=self.__event_loop
+                )
+
+        except Exception as err:
+            self.logger.debug(f"__price_data_callback exception: {err}, traceback:\n{traceback.format_exc()}")
+
     async def __price_data_queue_handler(self):
         def add_item(my_list, new_item):
             my_list.append(new_item)
@@ -726,14 +783,10 @@ class TradingHeroAlpha(Strategy):
 
                 # Pass the message for further processing (or not)
                 if pass_data_flag:
-                    # try:
-                    #     self.__price_data_queue_symbol[symbol].put_nowait(data)
-                    # except asyncio.QueueFull as err:
-                    #     self.logger.warning(f"Queue for {symbol} is full! err {err}")
-
-                    #asyncio.ensure_future(
-                    self.__event_loop.create_task(self.__realtime_price_data_processor(data))
-                    #)
+                    asyncio.ensure_future(
+                        self.__realtime_price_data_processor(data),
+                        loop=self.__event_loop
+                    )
 
             except (TimeoutError, asyncio.TimeoutError):
                 pass
@@ -747,7 +800,6 @@ class TradingHeroAlpha(Strategy):
         self.logger.debug(f"__price_data_queue_handler finished ...")
 
     async def __realtime_price_data_processor(self, data):
-    # async def __realtime_price_data_processor(self, symbol: str):
         def order_success_routine(symbol, response, order_type):
             try:
                 if order_type == "enter":
@@ -786,255 +838,35 @@ class TradingHeroAlpha(Strategy):
         # ########################
         #        Main body
         # ########################
-        # while symbol not in self.__symbols_task_done:
-        #     # Retrieve data
-        #     try:
-        #         data: dict | None = None
-        #         data = await asyncio.wait_for(
-        #             self.__price_data_queue_symbol[symbol].get(), timeout=5
-        #         )
-        #
-        #         if data.get("symbol", "not likely") != symbol:
-        #             raise Exception
-        #
-        #     except asyncio.TimeoutError:
-        #         continue
-        #
-        #     except KeyError as err:
-        #         self.logger.error(f"Symbol {symbol} is not in the queue, err {err}! Will not process this symbol.")
-        #         self.logger.debug(f"price data queue per symbol keys: {self.__price_data_queue_symbol.keys()}")
-        #         self.logger.debug(f"Traceback\n{traceback.format_exc()}")
-        #         break
-        #
-        #     except Exception as err:
-        #         self.logger.error(f"Symbol {symbol} retrieve data exception: {err}, " +
-        #                           f"traceback\n{traceback.format_exc()}")
-        #         continue
-        if True:
-            # Trading logic
-            initialization_time = time.time()
-            symbol = None
-            is_locked = False
+        # Trading logic
+        initialization_time = time.time()
+        symbol = None
+        is_locked = False
 
-            try:
-                # Proceed to the trading logic
-                symbol = data["symbol"]
-                is_continuous = True if "isContinuous" in data else False
-                is_open = True if "isOpen" in data else False
+        try:
+            # Proceed to the trading logic
+            symbol = data["symbol"]
+            is_continuous = True if "isContinuous" in data else False
+            is_open = True if "isOpen" in data else False
 
-                if is_open:
-                    self.logger.info(f"Market open {symbol}: {data}")
+            if is_open:
+                self.logger.info(f"Market open {symbol}: {data}")
 
-                # Cutout stock that does not fit the open price goal
-                if (symbol not in self.__open_price_today) and \
-                        (is_open or is_continuous) and \
-                        ("price" in data) and (not self.__is_reload):
+            # Cutout stock that does not fit the open price goal
+            if (symbol not in self.__open_price_today) and \
+                    (is_open or is_continuous) and \
+                    ("price" in data) and (not self.__is_reload):
 
-                    self.__open_price_today[symbol] = float(data["price"])
+                self.__open_price_today[symbol] = float(data["price"])
 
-                    gap_change_pct = 100 * (self.__open_price_today[symbol] - self.__lastday_close[symbol]) \
-                                     / self.__lastday_close[symbol]
+                gap_change_pct = 100 * (self.__open_price_today[symbol] - self.__lastday_close[symbol]) \
+                                 / self.__lastday_close[symbol]
 
-                    if (gap_change_pct <= 1) or (gap_change_pct >= 7):  # Do not trade this target today
-                        self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的" +
-                                         f"lastday_close: {self.__lastday_close[symbol]}, " +
-                                          f"open_price_today: {self.__open_price_today[symbol]}")
-                        self.__open_order_placed[symbol] = 99999
-                        self.__event_loop.run_in_executor(
-                            self.__threadpool_executor,
-                            self.remove_realtime_marketdata,
-                            symbol
-                        )
-                        self.__symbols_task_done.append(symbol)
-
-                        return
-                    elif is_open:
-                        self.logger.debug(f"{symbol} 開盤漲幅符合區間 (實際漲幅: {gap_change_pct:.2f} %). " +
-                                          f"lastday_close: {self.__lastday_close[symbol]}, " +
-                                          f"open_price_today: {self.__open_price_today[symbol]}")
-
-
-                # Start trading logic =============
-                order_lock_checkpoint_start = time.time()
-                await self.__on_going_orders_lock[symbol].acquire()
-                order_lock_checkpoint_end = time.time()
-
-                is_locked = True
-
-                # Start processing this tick
-                now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
-
-                # 開盤動作
-                if (now_time < self.__strategy_enter_cutoff_time) and \
-                        (not self.__is_reload) and \
-                        (symbol not in self.__suspend_entering_symbols) and \
-                        (symbol not in self.__open_order_placed or
-                         self.__open_order_placed[symbol] < self.__enter_lot_limit):
-
-                    if symbol not in self.__active_target_list:
-                        self.logger.info(f"{symbol} 尚未納入進場列表: {self.__active_target_list}")
-
-                    elif ("bid" not in data) or (float(data["bid"]) == 0):
-                        self.logger.debug(f"{symbol} 進場判斷邏輯讀無 bid 價格, data:\n{data}")
-
-                    else:
-                        # Calculate price change
-                        try:
-                            baseline_price = float(data["price"]) if "price" in data else float(data["bid"])
-
-                        except Exception as error:
-                            baseline_price = float(data["bid"])
-
-                            self.logger.debug(
-                                f"{symbol} read price exception {error}. data: {data}. " +
-                                f"Traceback: {traceback.format_exc()}"
-                            )
-
-                        price_change_pct_bid = 100 * (baseline_price - self.__lastday_close[symbol]) / \
-                                               self.__lastday_close[symbol]
-
-                        # Check for entering condition
-                        quantity_to_bid = 0
-                        pre_allocate_fund = 0
-                        fund_lock_checkpoint_start = fund_lock_checkpoint_end = 0  # init the timer variables
-
-                        if (1 < price_change_pct_bid < 7) and \
-                                (baseline_price < self.__max_price_seen[symbol]) and \
-                                (baseline_price < self.__average_price[symbol]):
-                            fund_lock_checkpoint_start = time.time()
-                            async with self.__fund_available_update_lock:
-                                fund_lock_checkpoint_end = time.time()
-                                max_share_possible = \
-                                    int((self.__fund_available / float(data["bid"])) / 1000) * 1000
-
-                                # Calculate quantity to bid
-                                if max_share_possible < 1000:
-                                    # self.logger.info(f"剩餘可用額度不足, symbol {symbol}, price {data['bid']}, " +
-                                    #                  f"fund_available {self.__fund_available}")
-                                    # self.logger.info(f"{symbol} 稍後再確認進場訊號 ...")
-                                    pass
-
-                                else:
-                                    quantity_to_bid = int(self.__enter_lot_limit * 1000)
-                                    if symbol in self.__open_order_placed:
-                                        quantity_to_bid -= self.__open_order_placed[symbol] * 1000
-
-                                    self.logger.debug(f"{symbol} 剩餘下單量 {quantity_to_bid} 股")
-
-                                    if max_share_possible < quantity_to_bid:
-                                        self.logger.debug(f"剩餘額動不足進場 {symbol}: {quantity_to_bid} 股," +
-                                                          f" 調整下單量至 1 張")
-                                        quantity_to_bid = 1000
-
-                                    # Pre-allocate fund
-                                    scale_factor = min(quantity_to_bid, self.__max_lot_per_round * 1000)
-                                    pre_allocate_fund = scale_factor * float(baseline_price)
-                                    self.__fund_available -= pre_allocate_fund
-
-                                    self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
-                                    self.logger.info(f"可用額度更新: {self.__fund_available}")
-
-                        # 進場操作
-                        if quantity_to_bid >= 1000:
-                            self.logger.info(f"{symbol} 進場條件成立 ...")
-
-                            quantity_has_bid = 0  # Record how much has already been bid this time
-
-                            while quantity_to_bid >= 1000:
-                                order = Order(
-                                    buy_sell=BSAction.Sell,
-                                    symbol=symbol,
-                                    price=None,
-                                    quantity=1000,
-                                    market_type=MarketType.Common,
-                                    price_type=PriceType.Market,
-                                    time_in_force=TimeInForce.IOC,
-                                    order_type=OrderType.DayTrade,
-                                    user_def="hvl_enter",
-                                )
-
-                                response, place_order_start_time, place_order_end_time = await self.__place_order(order)
-
-                                if response.is_success:
-                                    self.logger.debug(f"{symbol} 下單成功! " + f"成功進場委託單直回:\n{response}")
-                                    self.logger.debug(
-                                        f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
-                                        f"Fund lock checkpoint: {1000 * (fund_lock_checkpoint_end - fund_lock_checkpoint_start):.6f} ms, " +
-                                        f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
-                                        f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
-                                        f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
-                                        f"觸發行情資料:\n {data}"
-                                    )
-
-                                    # Update the order record
-                                    if symbol in self.__open_order_placed:
-                                        self.__open_order_placed[symbol] += 1
-                                    else:
-                                        self.__open_order_placed[symbol] = 1
-
-                                    self.logger.info(
-                                        f"{symbol} 進場下單成功, 總進場張數 {self.__open_order_placed[symbol]}")
-
-                                    # Update pre-allocated fund
-                                    pre_allocate_fund -= 1000 * float(baseline_price)
-                                    self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
-
-                                    # Execute the routine after a success order
-                                    order_success_routine(symbol, response, "enter")
-
-                                    # Update remain quantity_to_bid
-                                    quantity_to_bid -= 1000
-                                    quantity_has_bid += 1000
-
-                                    self.logger.debug(f"{symbol} 已下單 {quantity_has_bid} 股，" +
-                                                      f"剩餘下單量 {quantity_to_bid} 股")
-
-                                    # Bid max shares per round
-                                    if quantity_has_bid >= self.__max_lot_per_round * 1000:
-                                        break
-
-                                else:
-                                    self.logger.debug(f"失敗進場委託單直回:\n{response}\n觸發行情:\n{data}")
-
-                                    # OS error handling
-                                    if ("Broken pipe" in response.message) or ("os error" in response.message):
-                                        raise OSError
-
-                                    if symbol in self.__failed_order_count:
-                                        self.__failed_order_count[symbol] += 1
-                                    else:
-                                        self.__failed_order_count[symbol] = 1
-
-                                    if self.__failed_order_count[symbol] >= 2:
-                                        if (symbol in self.__open_order_placed) and \
-                                                (self.__open_order_placed[symbol] > 0):
-                                            self.logger.info(f"{symbol} 已進場 " +
-                                                             f"{self.__open_order_placed[symbol]} 張, " +
-                                                             f'剩餘量委託失敗次數過多取消')
-                                            self.logger.info(f"{symbol} 不再確認進場訊號 ...")
-                                            self.__suspend_entering_symbols.append(symbol)
-
-                                    else:
-                                        self.logger.info(f"{symbol} 進場下單失敗次數達 2 次且未進場，移除標的")
-                                        self.__open_order_placed[symbol] = 99999
-                                        self.__event_loop.run_in_executor(
-                                            self.__threadpool_executor,
-                                            self.remove_realtime_marketdata,
-                                            symbol
-                                        )
-                                        self.__symbols_task_done.append(symbol)
-
-                                    # Cancel ramin quantity_to_bid
-                                    quantity_to_bid = -99999
-
-                            # Adjust for actual used fund
-                            async with self.__fund_available_update_lock:
-                                self.__fund_available += pre_allocate_fund
-                                self.logger.info(f"{symbol} 實際運用差額: {pre_allocate_fund}")
-                                self.logger.info(f"可用額度更新: {self.__fund_available}")
-
-                elif (symbol not in self.__open_order_placed) and (not self.__is_reload):  # 今天完全沒進場
-                    self.logger.info(f"{symbol} 今日無進場，移除股價行情訂閱 ...")
+                if (gap_change_pct <= 1) or (gap_change_pct >= 7):  # Do not trade this target today
+                    self.logger.info(f"{symbol} 開盤漲幅超過區間 (實際漲幅: {gap_change_pct:.2f} %)，移除標的" +
+                                     f"lastday_close: {self.__lastday_close[symbol]}, " +
+                                      f"open_price_today: {self.__open_price_today[symbol]}")
+                    self.__open_order_placed[symbol] = 99999
                     self.__event_loop.run_in_executor(
                         self.__threadpool_executor,
                         self.remove_realtime_marketdata,
@@ -1042,172 +874,362 @@ class TradingHeroAlpha(Strategy):
                     )
                     self.__symbols_task_done.append(symbol)
 
-                # 停損停利出場
-                if (now_time < self.__strategy_exit_time) and \
-                        (symbol in self.__position_info) and \
-                        (not self.__on_going_orders[symbol]):
+                    return
+                elif is_open:
+                    self.logger.debug(f"{symbol} 開盤漲幅符合區間 (實際漲幅: {gap_change_pct:.2f} %). " +
+                                      f"lastday_close: {self.__lastday_close[symbol]}, " +
+                                      f"open_price_today: {self.__open_price_today[symbol]}")
 
-                    info = self.__position_info[symbol]
-                    sell_price = info["price"]
-                    ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
-                        data["price"])  # Add if for robustness
 
-                    is_early_session = now_time <= datetime.time(9, 30)
-                    current_pnl_pct = 100 * (sell_price - ask_price) / ask_price
-                    gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
-                        symbol]
+            # Start trading logic =============
+            order_lock_checkpoint_start = time.time()
+            await self.__on_going_orders_lock[symbol].acquire()
+            order_lock_checkpoint_end = time.time()
 
-                    if (self.__trail_stop_profit_cutoff[symbol] < 0) and (current_pnl_pct >= 3.5):
-                        # Set the cutoff to the current_pnl_pct
-                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
-                    elif (self.__trail_stop_profit_cutoff[symbol] > 0) and \
-                            (current_pnl_pct - self.__trail_stop_profit_cutoff[symbol] >= 1):
-                        # Rise the cutoff
-                        self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
+            is_locked = True
 
-                    stop_condition_1 = is_early_session and (current_pnl_pct <= -5)
-                    # ((current_pnl_pct >= 8) or (current_pnl_pct <= -5))
-                    stop_condition_2 = (not is_early_session) and (current_pnl_pct <= -3)
-                    # ((current_pnl_pct >= 6) or (current_pnl_pct <= -3))
-                    stop_condition_zeta = (gap_until_now_pct >= 8)
-                    stop_condition_alpha = current_pnl_pct < self.__trail_stop_profit_cutoff[symbol]
+            # Start processing this tick
+            now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
 
-                    if stop_condition_zeta or stop_condition_1 or stop_condition_2 or stop_condition_alpha:
-                        self.logger.info(f"{symbol} 停損/停利條件成立 ...")
+            # 開盤動作
+            if (now_time < self.__strategy_enter_cutoff_time) and \
+                    (not self.__is_reload) and \
+                    (symbol not in self.__suspend_entering_symbols) and \
+                    (symbol not in self.__open_order_placed or
+                     self.__open_order_placed[symbol] < self.__enter_lot_limit):
 
-                        if stop_condition_zeta:
-                            self.logger.info(f"{symbol} 漲幅達 {gap_until_now_pct} %, 斷然出場！")
+                if symbol not in self.__active_target_list:
+                    self.logger.info(f"{symbol} 尚未納入進場列表: {self.__active_target_list}")
+
+                elif ("bid" not in data) or (float(data["bid"]) == 0):
+                    self.logger.debug(f"{symbol} 進場判斷邏輯讀無 bid 價格, data:\n{data}")
+
+                else:
+                    # Calculate price change
+                    try:
+                        baseline_price = float(data["price"]) if "price" in data else float(data["bid"])
+
+                    except Exception as error:
+                        baseline_price = float(data["bid"])
+
+                        self.logger.debug(
+                            f"{symbol} read price exception {error}. data: {data}. " +
+                            f"Traceback: {traceback.format_exc()}"
+                        )
+
+                    price_change_pct_bid = 100 * (baseline_price - self.__lastday_close[symbol]) / \
+                                           self.__lastday_close[symbol]
+
+                    # Check for entering condition
+                    quantity_to_bid = 0
+                    pre_allocate_fund = 0
+                    fund_lock_checkpoint_start = fund_lock_checkpoint_end = 0  # init the timer variables
+
+                    if (1 < price_change_pct_bid < 7) and \
+                            (baseline_price < self.__max_price_seen[symbol]) and \
+                            (baseline_price < self.__average_price[symbol]):
+                        fund_lock_checkpoint_start = time.time()
+                        async with self.__fund_available_update_lock:
+                            fund_lock_checkpoint_end = time.time()
+                            max_share_possible = \
+                                int((self.__fund_available / float(data["bid"])) / 1000) * 1000
+
+                            # Calculate quantity to bid
+                            if max_share_possible < 1000:
+                                # self.logger.info(f"剩餘可用額度不足, symbol {symbol}, price {data['bid']}, " +
+                                #                  f"fund_available {self.__fund_available}")
+                                # self.logger.info(f"{symbol} 稍後再確認進場訊號 ...")
+                                pass
+
+                            else:
+                                quantity_to_bid = int(self.__enter_lot_limit * 1000)
+                                if symbol in self.__open_order_placed:
+                                    quantity_to_bid -= self.__open_order_placed[symbol] * 1000
+
+                                self.logger.debug(f"{symbol} 剩餘下單量 {quantity_to_bid} 股")
+
+                                if max_share_possible < quantity_to_bid:
+                                    self.logger.debug(f"剩餘額動不足進場 {symbol}: {quantity_to_bid} 股," +
+                                                      f" 調整下單量至 1 張")
+                                    quantity_to_bid = 1000
+
+                                # Pre-allocate fund
+                                scale_factor = min(quantity_to_bid, self.__max_lot_per_round * 1000)
+                                pre_allocate_fund = scale_factor * float(baseline_price)
+                                self.__fund_available -= pre_allocate_fund
+
+                                self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
+                                self.logger.info(f"可用額度更新: {self.__fund_available}")
+
+                    # 進場操作
+                    if quantity_to_bid >= 1000:
+                        self.logger.info(f"{symbol} 進場條件成立 ...")
+
+                        quantity_has_bid = 0  # Record how much has already been bid this time
+
+                        while quantity_to_bid >= 1000:
                             order = Order(
-                                buy_sell=BSAction.Buy,
-                                symbol=symbol,
-                                price=None,
-                                quantity=int(self.__position_info[symbol]["size"]),
-                                market_type=MarketType.Common,
-                                price_type=PriceType.Market,
-                                time_in_force=TimeInForce.ROD,
-                                order_type=OrderType.Stock,
-                                user_def="hvl_stop",
-                            )
-                        else:
-                            order = Order(
-                                buy_sell=BSAction.Buy,
+                                buy_sell=BSAction.Sell,
                                 symbol=symbol,
                                 price=None,
                                 quantity=1000,
                                 market_type=MarketType.Common,
                                 price_type=PriceType.Market,
                                 time_in_force=TimeInForce.IOC,
-                                order_type=OrderType.Stock,
-                                user_def="hvl_stop",
+                                order_type=OrderType.DayTrade,
+                                user_def="hvl_enter",
                             )
-
-                        # 下單
-                        if self.__failed_exit_order_count.get(symbol, 0) < 5:
 
                             response, place_order_start_time, place_order_end_time = await self.__place_order(order)
 
                             if response.is_success:
-                                self.logger.info(f"{symbol} 停損/停利下單成功")
+                                self.logger.debug(f"{symbol} 下單成功! " + f"成功進場委託單直回:\n{response}")
                                 self.logger.debug(
                                     f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
+                                    f"Fund lock checkpoint: {1000 * (fund_lock_checkpoint_end - fund_lock_checkpoint_start):.6f} ms, " +
                                     f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
                                     f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
                                     f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
-                                    f"觸發行情資料:\n {data}\nresponse:\n{response}"
+                                    f"觸發行情資料:\n {data}"
                                 )
 
-                                # Execute the routine after a success order
-                                order_success_routine(symbol, response, "stop")
-
-                            elif (response.message is not None) and ("集合競價" in response.message):
-                                self.logger.info(f"集合競價! 失敗停損/停利出場委託單直回:\n{response}")
-
-                                if current_pnl_pct < 0 or stop_condition_zeta:
-                                    self.logger.info(f"集合競價停損, 斷然出場 ...")
-
-                                    order = Order(
-                                        buy_sell=BSAction.Buy,
-                                        symbol=symbol,
-                                        price=None,
-                                        quantity=int(self.__position_info[symbol]["size"]),
-                                        market_type=MarketType.Common,
-                                        price_type=PriceType.LimitUp,
-                                        time_in_force=TimeInForce.ROD,
-                                        order_type=OrderType.Stock,
-                                        user_def="hvl_stop",
-                                    )
-
-                                    response, place_order_start_time, place_order_end_time = await self.__place_order(
-                                        order)
-
-                                    self.logger.debug(
-                                        f"集合競價停損出場單: " +
-                                        f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
-                                        f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
-                                        f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
-                                        f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
-                                        f"觸發行情資料:\n{data}\nresponse:\n{response}"
-                                    )
-
-                                    # Execute the routine after a success order
-                                    order_success_routine(symbol, response, "stop")
+                                # Update the order record
+                                if symbol in self.__open_order_placed:
+                                    self.__open_order_placed[symbol] += 1
                                 else:
-                                    self.logger.info(f"集合競價停利, 等待 5 秒再處理 ..., 觸發行情\n{data}")
-                                    await asyncio.sleep(5)
+                                    self.__open_order_placed[symbol] = 1
 
-                            elif (response.message is not None) and ("價格穩定" in response.message):
-                                self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
-                                await asyncio.sleep(5)
+                                self.logger.info(
+                                    f"{symbol} 進場下單成功, 總進場張數 {self.__open_order_placed[symbol]}")
+
+                                # Update pre-allocated fund
+                                pre_allocate_fund -= 1000 * float(baseline_price)
+                                self.logger.info(f"{symbol} 預留下單額度更新: {pre_allocate_fund}")
+
+                                # Execute the routine after a success order
+                                order_success_routine(symbol, response, "enter")
+
+                                # Update remain quantity_to_bid
+                                quantity_to_bid -= 1000
+                                quantity_has_bid += 1000
+
+                                self.logger.debug(f"{symbol} 已下單 {quantity_has_bid} 股，" +
+                                                  f"剩餘下單量 {quantity_to_bid} 股")
+
+                                # Bid max shares per round
+                                if quantity_has_bid >= self.__max_lot_per_round * 1000:
+                                    break
 
                             else:
-                                self.logger.debug(f"失敗停損出場委託單直回:\n{response}\n觸發行情:\n{data}")
+                                self.logger.debug(f"失敗進場委託單直回:\n{response}\n觸發行情:\n{data}")
 
                                 # OS error handling
                                 if ("Broken pipe" in response.message) or ("os error" in response.message):
                                     raise OSError
 
-                                if symbol in self.__failed_exit_order_count:
-                                    self.__failed_exit_order_count[symbol] += 1
+                                if symbol in self.__failed_order_count:
+                                    self.__failed_order_count[symbol] += 1
                                 else:
-                                    self.__failed_exit_order_count[symbol] = 1
+                                    self.__failed_order_count[symbol] = 1
 
-                                if self.__failed_exit_order_count[symbol] >= 5:
-                                    self.logger.warning(f"{symbol} 停損/利下單失敗次數達 5 次!")
-                        else:
-                            self.logger.warning(f"{symbol} 停損/利下單失敗次數過多! 手動處理!")
-                            # Remove position info for the symbol
-                            if symbol in self.__position_info:
-                                del self.__position_info[symbol]
-                                self.__flush_position_info()
+                                if self.__failed_order_count[symbol] >= 2:
+                                    if (symbol in self.__open_order_placed) and \
+                                            (self.__open_order_placed[symbol] > 0):
+                                        self.logger.info(f"{symbol} 已進場 " +
+                                                         f"{self.__open_order_placed[symbol]} 張, " +
+                                                         f'剩餘量委託失敗次數過多取消')
+                                        self.logger.info(f"{symbol} 不再確認進場訊號 ...")
+                                        self.__suspend_entering_symbols.append(symbol)
 
-                            # Unsubscribe the price data
-                            self.__event_loop.run_in_executor(
-                                self.__threadpool_executor,
-                                self.remove_realtime_marketdata,
-                                symbol
+                                else:
+                                    self.logger.info(f"{symbol} 進場下單失敗次數達 2 次且未進場，移除標的")
+                                    self.__open_order_placed[symbol] = 99999
+                                    self.__event_loop.run_in_executor(
+                                        self.__threadpool_executor,
+                                        self.remove_realtime_marketdata,
+                                        symbol
+                                    )
+                                    self.__symbols_task_done.append(symbol)
+
+                                # Cancel ramin quantity_to_bid
+                                quantity_to_bid = -99999
+
+                        # Adjust for actual used fund
+                        async with self.__fund_available_update_lock:
+                            self.__fund_available += pre_allocate_fund
+                            self.logger.info(f"{symbol} 實際運用差額: {pre_allocate_fund}")
+                            self.logger.info(f"可用額度更新: {self.__fund_available}")
+
+            elif (symbol not in self.__open_order_placed) and (not self.__is_reload):  # 今天完全沒進場
+                self.logger.info(f"{symbol} 今日無進場，移除股價行情訂閱 ...")
+                self.__event_loop.run_in_executor(
+                    self.__threadpool_executor,
+                    self.remove_realtime_marketdata,
+                    symbol
+                )
+                self.__symbols_task_done.append(symbol)
+
+            # 停損停利出場
+            if (now_time < self.__strategy_exit_time) and \
+                    (symbol in self.__position_info) and \
+                    (not self.__on_going_orders[symbol]):
+
+                info = self.__position_info[symbol]
+                sell_price = info["price"]
+                ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
+                    data["price"])  # Add if for robustness
+
+                is_early_session = now_time <= datetime.time(9, 30)
+                current_pnl_pct = 100 * (sell_price - ask_price) / ask_price
+                gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
+                    symbol]
+
+                if (self.__trail_stop_profit_cutoff[symbol] < 0) and (current_pnl_pct >= 3.5):
+                    # Set the cutoff to the current_pnl_pct
+                    self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
+                elif (self.__trail_stop_profit_cutoff[symbol] > 0) and \
+                        (current_pnl_pct - self.__trail_stop_profit_cutoff[symbol] >= 1):
+                    # Rise the cutoff
+                    self.__trail_stop_profit_cutoff[symbol] = current_pnl_pct - 0.5
+
+                stop_condition_1 = is_early_session and (current_pnl_pct <= -5)
+                # ((current_pnl_pct >= 8) or (current_pnl_pct <= -5))
+                stop_condition_2 = (not is_early_session) and (current_pnl_pct <= -3)
+                # ((current_pnl_pct >= 6) or (current_pnl_pct <= -3))
+                stop_condition_zeta = (gap_until_now_pct >= 8)
+                stop_condition_alpha = current_pnl_pct < self.__trail_stop_profit_cutoff[symbol]
+
+                if stop_condition_zeta or stop_condition_1 or stop_condition_2 or stop_condition_alpha:
+                    self.logger.info(f"{symbol} 停損/停利條件成立 ...")
+
+                    if stop_condition_zeta:
+                        self.logger.info(f"{symbol} 漲幅達 {gap_until_now_pct} %, 斷然出場！")
+                        order = Order(
+                            buy_sell=BSAction.Buy,
+                            symbol=symbol,
+                            price=None,
+                            quantity=int(self.__position_info[symbol]["size"]),
+                            market_type=MarketType.Common,
+                            price_type=PriceType.Market,
+                            time_in_force=TimeInForce.ROD,
+                            order_type=OrderType.Stock,
+                            user_def="hvl_stop",
+                        )
+                    else:
+                        order = Order(
+                            buy_sell=BSAction.Buy,
+                            symbol=symbol,
+                            price=None,
+                            quantity=1000,
+                            market_type=MarketType.Common,
+                            price_type=PriceType.Market,
+                            time_in_force=TimeInForce.IOC,
+                            order_type=OrderType.Stock,
+                            user_def="hvl_stop",
+                        )
+
+                    # 下單
+                    if self.__failed_exit_order_count.get(symbol, 0) < 5:
+
+                        response, place_order_start_time, place_order_end_time = await self.__place_order(order)
+
+                        if response.is_success:
+                            self.logger.info(f"{symbol} 停損/停利下單成功")
+                            self.logger.debug(
+                                f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
+                                f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
+                                f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
+                                f"觸發行情資料:\n {data}\nresponse:\n{response}"
                             )
 
-                            # Add the symbol to the task done list
-                            self.__symbols_task_done.append(symbol)
+                            # Execute the routine after a success order
+                            order_success_routine(symbol, response, "stop")
 
-            except OSError as err:
-                self.logger.error(f"OS Error {err} while sending orders, restart the strategy subprocess ...")
-                self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
-                self.__self_restart()
+                        elif (response.message is not None) and ("集合競價" in response.message):
+                            self.logger.info(f"集合競價! 失敗停損/停利出場委託單直回:\n{response}")
 
-            except Exception as err:
-                self.logger.error(f"__realtime_price_data_processor, error: {err}")
-                self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
-                self.logger.debug(f"\treceived data: {data}")
+                            if current_pnl_pct < 0 or stop_condition_zeta:
+                                self.logger.info(f"集合競價停損, 斷然出場 ...")
 
-            finally:
-                if is_locked:
-                    self.__on_going_orders_lock[symbol].release()
+                                order = Order(
+                                    buy_sell=BSAction.Buy,
+                                    symbol=symbol,
+                                    price=None,
+                                    quantity=int(self.__position_info[symbol]["size"]),
+                                    market_type=MarketType.Common,
+                                    price_type=PriceType.LimitUp,
+                                    time_in_force=TimeInForce.ROD,
+                                    order_type=OrderType.Stock,
+                                    user_def="hvl_stop",
+                                )
 
-                # # Await
-                # await asyncio.sleep(0)
+                                response, place_order_start_time, place_order_end_time = await self.__place_order(
+                                    order)
 
-        # self.logger.debug(f"__realtime_price_data_processor - {symbol} finished ...")
+                                self.logger.debug(
+                                    f"集合競價停損出場單: " +
+                                    f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
+                                    f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
+                                    f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                    f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
+                                    f"觸發行情資料:\n{data}\nresponse:\n{response}"
+                                )
+
+                                # Execute the routine after a success order
+                                order_success_routine(symbol, response, "stop")
+                            else:
+                                self.logger.info(f"集合競價停利, 等待 5 秒再處理 ..., 觸發行情\n{data}")
+                                await asyncio.sleep(5)
+
+                        elif (response.message is not None) and ("價格穩定" in response.message):
+                            self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
+                            await asyncio.sleep(5)
+
+                        else:
+                            self.logger.debug(f"失敗停損出場委託單直回:\n{response}\n觸發行情:\n{data}")
+
+                            # OS error handling
+                            if ("Broken pipe" in response.message) or ("os error" in response.message):
+                                raise OSError
+
+                            if symbol in self.__failed_exit_order_count:
+                                self.__failed_exit_order_count[symbol] += 1
+                            else:
+                                self.__failed_exit_order_count[symbol] = 1
+
+                            if self.__failed_exit_order_count[symbol] >= 5:
+                                self.logger.warning(f"{symbol} 停損/利下單失敗次數達 5 次!")
+                    else:
+                        self.logger.warning(f"{symbol} 停損/利下單失敗次數過多! 手動處理!")
+                        # Remove position info for the symbol
+                        if symbol in self.__position_info:
+                            del self.__position_info[symbol]
+                            self.__flush_position_info()
+
+                        # Unsubscribe the price data
+                        self.__event_loop.run_in_executor(
+                            self.__threadpool_executor,
+                            self.remove_realtime_marketdata,
+                            symbol
+                        )
+
+                        # Add the symbol to the task done list
+                        self.__symbols_task_done.append(symbol)
+
+        except OSError as err:
+            self.logger.error(f"OS Error {err} while sending orders, restart the strategy subprocess ...")
+            self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+            self.__self_restart()
+
+        except Exception as err:
+            self.logger.error(f"__realtime_price_data_processor, error: {err}")
+            self.logger.debug(f"\ttraceback:\n{traceback.format_exc()}")
+            self.logger.debug(f"\treceived data: {data}")
+
+        finally:
+            if is_locked:
+                self.__on_going_orders_lock[symbol].release()
 
     def __order_filled_processor(self, code, filled_data):
         asyncio.run_coroutine_threadsafe(
