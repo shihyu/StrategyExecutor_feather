@@ -91,7 +91,7 @@ class TradingHeroAlpha(Strategy):
         self.queue: multiprocessing.Queue = the_queue
 
         # Setup target symbols
-        self.__symbols = ['1524', '6158', '00710B', '6591', '2431', '3489', '3540', '00726B', '1337', '8249', '6024', '3219', '3317', '6248', '2342', '00730', '3441', '3484', '8131', '00756B', '8431', '4523']
+        self.__symbols = ['3441', '1737', '4541', '1735', '5215']
 
         self.__symbols_task_done = []
 
@@ -146,9 +146,9 @@ class TradingHeroAlpha(Strategy):
             # self.__on_going_orders_lock[s] = asyncio.Lock()
 
         # Position sizing
-        self.__fund_available = 400000
-        self.__enter_lot_limit = 3
-        self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
+        self.__fund_available = 368800
+        self.__enter_lot_limit = 2
+        self.__max_lot_per_round = min(1, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
         self.__active_target_list = []
         self.logger.info(f"初始可用額度: {self.__fund_available} TWD")
@@ -296,6 +296,7 @@ class TradingHeroAlpha(Strategy):
                     elif datetime.datetime.strptime(response["date"], "%Y-%m-%d").date() != \
                             datetime.datetime.now(ZoneInfo("Asia/Taipei")).date():
                         self.logger.info(f"Date {response["date"]} is not today, wait and try again ...")
+                        # self.logger.debug(f"data:\n{response}")
                         await asyncio.sleep(60)
                     else:
                         is_task_success = True

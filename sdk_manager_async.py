@@ -608,12 +608,11 @@ class SDKManager:
                 # return
 
         # Set callbacks
-        for ws in self.__ws_connections:
-            ws.ee.remove_all_listeners()
-            ws.on("connect", self.on_connect_callback)
-            ws.on("disconnect", self.on_disconnect_callback)
-            ws.on("error", self.on_error_callback)
-            ws.on("message", self.__ws_on_message_handler)
+        # for ws in self.__ws_connections:
+        #     ws.on("connect", self.on_connect_callback)
+        #     ws.on("disconnect", self.on_disconnect_callback)
+        #     ws.on("error", self.on_error_callback)
+        #     ws.on("message", self.__ws_on_message_handler)
 
     @check_is_terminated
     def set_ws_message_handle_queue(self, queue: asyncio.Queue):
@@ -680,14 +679,16 @@ class SDKManager:
                 time_now = time.time()
                 msg = json.loads(message)  # Loads json str to dictionary
 
-                if (msg["event"] == "data") and (self.__ws_message_queue is not None):
-                    # Add meta-data
-                    msg["data"]["ws_received_time"] = time_now
-                    msg["data"]["ws_latency"] = time_now - int(msg["data"]["time"]) / 1000000
-
-                    # Invoke the callback
+                if (msg["event"] == "data") and (self.on_message_callback is not None):
                     try:
+                        # Add meta-data
+                        msg["data"]["ws_received_time"] = time_now
+                        msg["data"]["ws_latency"] = time_now - int(msg["data"]["time"]) / 1000000
+
+                        # Invoke the callback
+                        #self.__logger.debug(f"sent callback {msg["data"]["ws_latency"]}")
                         self.on_message_callback(msg["data"])
+                        #self.__logger.debug(f"sent callback completed")
                     except Exception as e:
                         self.__logger.error(f"self.__trade_message_queue Exception: {e}, " +
                                             f"traceback:\n{traceback.format_exc()}")
