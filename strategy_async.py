@@ -136,18 +136,14 @@ class TradingHeroAlpha(Strategy):
 
         self.__suspend_entering_symbols = []
 
-        # self.__price_data_queue_symbol: dict[str, asyncio.Queue] | None = None
-        # self.__price_data_processor_tasks = []
-
         for s in self.__symbols:
             self.__on_going_orders[s] = []
             self.__order_type_enter[s] = []
             self.__order_type_exit[s] = []
-            # self.__on_going_orders_lock[s] = asyncio.Lock()
 
         # Position sizing
-        self.__fund_available = 368800
-        self.__enter_lot_limit = 2
+        self.__fund_available = 398600  # 總下單額度控管
+        self.__enter_lot_limit = 3  # 單一商品總下單張數上限
         self.__max_lot_per_round = min(1, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
         self.__active_target_list = []
@@ -168,7 +164,6 @@ class TradingHeroAlpha(Strategy):
 
         # The async loops
         self.__event_loop: asyncio.events.AbstractEventLoop | None = None
-        # self.__price_data_queue_event_loop: asyncio.events.AbstractEventLoop = asyncio.new_event_loop()
 
     def __flush_position_info(self):
         # Send message to the multiprocessing queue
@@ -259,7 +254,6 @@ class TradingHeroAlpha(Strategy):
 
         # Finishing ...
         self.__threadpool_executor.shutdown(wait=False, cancel_futures=True)
-        # self.__price_data_queue_event_loop.close()
         self.__event_loop.close()
         self.logger_shutdown.set()
 
@@ -402,8 +396,11 @@ class TradingHeroAlpha(Strategy):
 
     async def __position_sizing_agent(self):
         """
-            Add 6 more symbols every 1 second after market open
+            Add x more symbols every y second after market open
         """
+        x = 6
+        y = 1
+
         now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
 
         while now_time < datetime.time(8, 59, 58):
@@ -418,14 +415,14 @@ class TradingHeroAlpha(Strategy):
 
             i = 0
             for symbol in self.__symbols:
-                if i > 6:
+                if i > x:
                     break
 
                 if symbol not in self.__active_target_list:
                     self.__active_target_list.append(symbol)
                     i += 1
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(y)
 
             now_time = datetime.datetime.now(ZoneInfo("Asia/Taipei")).time()
 
@@ -707,85 +704,6 @@ class TradingHeroAlpha(Strategy):
         except Exception as err:
             self.logger.debug(f"__price_data_callback exception: {err}, " +
                               f"traceback:\n{traceback.format_exc()}\n, data:\n{data}")
-
-    async def __price_data_queue_handler(self):
-        def add_item(my_list, new_item):
-            my_list.append(new_item)
-            if len(my_list) > 5:
-                my_list.pop(0)
-
-        self.logger.debug(f"__price_data_queue_handler start running ...")
-
-        while not self.__is_market_close_time_passed:
-            try:
-                async with asyncio.timeout(5):
-                    data = await self.__ws_message_queue.get()
-
-                # Update the newest timestamp over all symbols
-                timestamp = int(data["time"])
-                if timestamp > self.__max_latest_price_timestamp:
-                    self.__max_latest_price_timestamp = timestamp
-
-                # Determine if pass to further processing
-                is_continuous = True if "isContinuous" in data else False
-                is_open = True if "isOpen" in data else False
-
-                pass_data_flag = False
-                symbol = data["symbol"]
-
-                if is_open or is_continuous:
-                    try:
-                        baseline_price = float(data["price"]) if "price" in data else float(data["bid"])
-                        if baseline_price > self.__max_price_seen[symbol]:
-                            self.__max_price_seen[symbol] = baseline_price
-
-                        # Update past prices seen
-                        add_item(self.__past_prices_seen[symbol], baseline_price)
-
-                        # Update the average price
-                        if len(self.__past_prices_seen[symbol]) >= 5:
-                            self.__average_price[symbol] = \
-                                numpy.mean(self.__past_prices_seen[symbol])
-
-                    except (KeyError, ValueError) as err:
-                        pass
-
-                if is_open:
-                    pass_data_flag = True
-                elif is_continuous:
-                    stop_condition_zeta = False
-                    if symbol in self.__position_info:
-                        # Calculate pre-screen variables
-                        ask_price = float(data["ask"]) if ("ask" in data and float(data["ask"]) > 0) else float(
-                            data["price"])  # Add if for robustness
-                        gap_until_now_pct = 100 * (ask_price - self.__lastday_close[symbol]) / self.__lastday_close[
-                            symbol]
-                        stop_condition_zeta = (gap_until_now_pct >= 8)
-
-                    if self.__is_reload:
-                        pass_data_flag = stop_condition_zeta or (not self.__on_going_orders_lock[symbol].locked())
-                    else:
-                        pass_data_flag = stop_condition_zeta or \
-                                         ((not self.__on_going_orders_lock[symbol].locked()) and
-                                          self.__average_price[symbol] > 0)
-
-                # Pass the message for further processing (or not)
-                if pass_data_flag:
-                    asyncio.ensure_future(
-                        self.__realtime_price_data_processor(data),
-                        loop=self.__event_loop
-                    )
-
-            except (TimeoutError, asyncio.TimeoutError):
-                pass
-
-            except Exception as err:
-                self.logger.debug(f"__price_data_queue_handler exception: {err}, traceback:\n{traceback.format_exc()}")
-
-            finally:
-                await asyncio.sleep(0)
-
-        self.logger.debug(f"__price_data_queue_handler finished ...")
 
     async def __realtime_price_data_processor(self, data):
         def order_success_routine(symbol, response, order_type):
