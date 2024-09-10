@@ -82,7 +82,7 @@ class Strategy(ABC):
 
 
 class TradingHeroAlpha(Strategy):
-    __version__ = "2024.12.8"
+    __version__ = "2024.12.9"
 
     def __init__(self, the_queue: multiprocessing.Queue, logger=None, log_level=logging.DEBUG):
         super().__init__(logger=logger, log_level=log_level)
@@ -104,7 +104,6 @@ class TradingHeroAlpha(Strategy):
         self.__max_price_seen: dict[str, float] | None = None
         self.__past_prices_seen: dict[str, list[float]] | None = None
         self.__average_price: dict[str, float] | None = None
-
 
         # Order coordinators
         self.__position_info = {}
@@ -142,9 +141,9 @@ class TradingHeroAlpha(Strategy):
             self.__order_type_exit[s] = []
 
         # Position sizing
-        self.__fund_available = 398600  # 總下單額度控管
+        self.__fund_available = 420000  # 總下單額度控管
         self.__enter_lot_limit = 3  # 單一商品總下單張數上限
-        self.__max_lot_per_round = min(1, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
+        self.__max_lot_per_round = min(2, self.__enter_lot_limit)  # Maximum number of round to send order non-stoping
         self.__fund_available_update_lock = asyncio.Lock()
         self.__active_target_list = []
         self.logger.info(f"初始可用額度: {self.__fund_available} TWD")
@@ -732,6 +731,14 @@ class TradingHeroAlpha(Strategy):
                     self.__on_going_orders_details[order_no] = {"ordered":0, "filled":0}
                 self.__on_going_orders_details[order_no]["ordered"] += float(response.data.after_qty)
 
+                # For 交易所價格穩定機制 0051
+                status = int(response.data.status)
+                if status == 90:
+                    self.__on_going_orders_details[order_no]["ordered"] = 0
+                    self.logger.debug(f"Error code 0051, set ordered to 0, " +
+                                      f"self.__on_going_orders_details:\n{self.__on_going_orders_details},\n" +
+                                      f"response:\n{response}")
+
                 self.logger.debug(
                     f"on_going_orders updated ({order_type}): symbol {symbol}, " +
                     f"order_no {response.data.order_no}, " +
@@ -1089,8 +1096,14 @@ class TradingHeroAlpha(Strategy):
                                 await asyncio.sleep(5)
 
                         elif (response.message is not None) and ("價格穩定" in response.message):
-                            self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
-                            await asyncio.sleep(5)
+                            if (response.code is not None) and ("51" in str(response.code)):
+                                # 價格穩定，可成交部分之委託數量生效
+                                self.logger.debung(f"價格穩定，可成交部分之委託數量生效, 剩餘剔退 ..., 觸發行情\n{data}")
+                                # Execute the routine after a success order
+                                order_success_routine(symbol, response, "stop")
+                            else:
+                                self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
+                                await asyncio.sleep(5)
 
                         else:
                             self.logger.debug(f"失敗停損出場委託單直回:\n{response}\n觸發行情:\n{data}")
