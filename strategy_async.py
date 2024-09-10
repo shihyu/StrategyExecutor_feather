@@ -1098,9 +1098,17 @@ class TradingHeroAlpha(Strategy):
                         elif (response.message is not None) and ("價格穩定" in response.message):
                             if (response.code is not None) and ("51" in str(response.code)):
                                 # 價格穩定，可成交部分之委託數量生效
-                                self.logger.debung(f"價格穩定，可成交部分之委託數量生效, 剩餘剔退 ..., 觸發行情\n{data}")
+                                self.logger.debung(f"價格穩定，可成交部分之委託數量生效, 剩餘剔退 ...")
                                 # Execute the routine after a success order
                                 order_success_routine(symbol, response, "stop")
+
+                                self.logger.debug(
+                                    f"Order lock checkpoint: {1000 * (order_lock_checkpoint_end - order_lock_checkpoint_start):.6f} ms, " +
+                                    f"啟動洗價等待時間 {1000 * (initialization_time - data['ws_received_time']):.6f} ms, " +
+                                    f"下單前置 {1000 * (place_order_start_time - data['ws_received_time']):.6f} ms, " +
+                                    f"速度 {1000 * (place_order_end_time - place_order_start_time):.6f} ms, " +
+                                    f"觸發行情資料:\n {data}\nresponse:\n{response}"
+                                )
                             else:
                                 self.logger.debug(f"價格穩定觸發，等待 5 秒再處理 ..., 觸發行情\n{data}")
                                 await asyncio.sleep(5)
